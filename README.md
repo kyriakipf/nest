@@ -1,4 +1,4 @@
-# 🏡 Nest — our money
+# 🏡 Nest
 
 Shared expense tracker, monthly budgets, stats, house-savings log and a savings / home-loan calculator.
 Plain HTML + JavaScript + Supabase. Installable as an app (PWA). Free to host on GitHub Pages.
