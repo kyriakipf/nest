@@ -368,3 +368,25 @@ h2 { font-weight: 600; }
   max-height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top) - 16px);
   padding-bottom: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
 .sheet.open .panel { transform: none; }
+/* Keep tags on one line */
+.tag { white-space: nowrap; }
+.cat .row.between { gap: 8px; }
+.cname { min-width: 0; white-space: nowrap; }
+.cat .row.between > .cname { flex: 1 1 auto; display: flex; align-items: center; gap: 8px; overflow: hidden; }
+.cname .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.cname .tag, .cname .ic, .cat .row.between > .amt { flex: none; }
+
+/* One save bar for all budgets */
+.catedit .r2 { grid-template-columns: 1fr 1fr; }
+.savebar { position: sticky; bottom: calc(66px + env(safe-area-inset-bottom)); z-index: 2; margin: 10px -4px 0;
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  background: var(--card2); border: 1px solid var(--line); border-radius: 12px; padding: 8px 8px 8px 14px; font-size: 14px; color: var(--muted); }
+.savebar.dirty { background: color-mix(in srgb, var(--brand) 12%, var(--card)); border-color: color-mix(in srgb, var(--brand) 45%, transparent); color: var(--text); font-weight: 600; }
+.savebar .btn { margin: 0; }
+.savebar .btn:disabled { background: var(--line); color: var(--muted); }
+/* Create / join screen */
+.join { max-width: 460px; padding-top: calc(env(safe-area-inset-top) + 8vh); }
+.join .fbody { min-height: 0; }
+.join .ftab { padding: 9px 16px 10px; }
+/* Sign-in card: centred with breathing room */
+.card.center { margin: calc(env(safe-area-inset-top) + 12vh) auto 0; width: calc(100% - 24px); max-width: 420px; padding: 22px 18px; }

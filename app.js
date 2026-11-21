@@ -231,7 +231,7 @@ let reloadTimer;
 function scheduleReload() {
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(async () => {
-    try { await loadData(); if (!isTyping()) render(); } catch {}
+    try { await loadData(); if (!isTyping() && !S.budgetsDirty) render(); } catch {}
   }, 500);
 }
 function subscribe() {
@@ -262,22 +262,28 @@ function renderAuth() {
   </div>`;
 }
 function renderJoin() {
-  app.innerHTML = `<div class="view">
-    <h1>Welcome</h1>
-    <p class="muted">One of you creates the household, the other joins with the invite code.</p>
-    <div class="card"><h2>Create a household</h2>
-      <form data-form="create" class="stack">
-        <input name="name" placeholder="Your name" required>
-        <input name="hname" placeholder="Household name" value="Our home">
-        <button class="btn primary">Create</button>
-      </form></div>
-    <div class="card"><h2>Join your partner</h2>
-      <form data-form="join" class="stack">
-        <input name="name" placeholder="Your name" required>
-        <input name="code" placeholder="Invite code (e.g. A1B2C3)" autocapitalize="characters" required>
-        <button class="btn primary">Join</button>
-      </form></div>
-    <button class="btn danger" data-act="signout">Sign out</button>
+  const tab = S.joinTab || 'create';
+  const t = (id, icon, label) => `<button class="ftab ${tab === id ? 'on' : ''}" data-act="joinTab" data-id="${id}">${ic(icon, 14)} ${label}</button>`;
+  const body = tab === 'create'
+    ? `<p class="muted" style="margin-top:0">Start your shared space. You'll get an invite code to send to your partner.</p>
+       <form data-form="create" class="stack">
+         <input name="name" placeholder="Your name" required autocomplete="given-name">
+         <input name="hname" placeholder="Household name" value="Our home">
+         <button class="btn primary">${ic('home', 16)} Create household</button>
+       </form>`
+    : `<p class="muted" style="margin-top:0">Your partner already created it? Enter the invite code they see in More → Household.</p>
+       <form data-form="join" class="stack">
+         <input name="name" placeholder="Your name" required autocomplete="given-name">
+         <input name="code" placeholder="Invite code (e.g. A1B2C3)" autocapitalize="characters" autocomplete="off" required>
+         <button class="btn primary">${ic('users', 16)} Join household</button>
+       </form>`;
+  app.innerHTML = `<div class="view join">
+    <div class="logo">${ic('logo', 28)}</div>
+    <h1 style="text-align:center">Welcome</h1>
+    <p class="muted" style="text-align:center;margin-bottom:18px">One of you creates the household, the other joins with the invite code.</p>
+    <div class="folders"><div class="fhead"><div class="ftabs">${t('create', 'plus', 'Create')}${t('join', 'users', 'Join')}</div></div>
+      <div class="fbody">${body}</div></div>
+    <button class="btn" data-act="signout" style="margin-top:14px">Sign out</button>
   </div>`;
 }
 
@@ -358,7 +364,7 @@ function viewHome() {
         ? `<div class="badge bad">${ic('alert', 13)} ${r.budget ? `Over budget by ${eur0(r.spent - r.budget)}` : 'No budget set'}</div>`
         : isFast ? `<div class="badge warn">${ic('clock', 13)} Slow down: only ${eur0(r.budget - r.spent)} left for ${daysLeft} days</div>` : '';
       return `<div class="cat ${isOver ? 'hl bad' : isFast ? 'hl warn' : ''}">
-        <div class="row between"><span class="cname">${catIc(r.c)} ${esc(r.c.name)}${sav ? ` <span class="tag sav">${savingKind(r.c) === 'joint' ? 'Joint savings' : 'Savings'}</span>` : ''}</span>
+        <div class="row between"><span class="cname">${catIc(r.c)} <span class="nm">${esc(r.c.name)}</span>${sav ? ` <span class="tag sav">${savingKind(r.c) === 'joint' ? 'Joint' : 'Savings'}</span>` : ''}</span>
           <span class="amt">${eur0(r.spent)}<span class="muted"> / ${r.budget ? eur0(r.budget) : '—'}</span></span></div>
         ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : sav ? 'var(--ok)' : 'var(--brand)')}${badge}</div>`;
     }).join('')
@@ -550,7 +556,8 @@ function calcValues() {
     const kind = mode === 'me' ? 'personal' : 'joint';
     const people = mode === 'me' ? S.members.filter(m => m.user_id === uid()) : S.members;
     const fromBudgets = sum(people, m => sum(S.cats.filter(c => savingKind(c) === kind), c => budgetOf(c.id, m.user_id)));
-    S.calc[mode] = { ...CALC_DEFAULTS[mode], target: v.goal || 100000, ...saved };
+    const { monthly: _m, target: _t, ...rest } = saved;   // older saved values for these are ignored
+    S.calc[mode] = { ...CALC_DEFAULTS[mode], ...rest, target: v.goal || 100000 };
     if (fromBudgets > 0) S.calc[mode].monthly = fromBudgets;
   }
   // Always the real amount (not editable); child savings only if switched on
@@ -633,8 +640,12 @@ function suggestSaving() {
   const actual = withData.length ? sum(withData, v => v) / withData.length : 0;
   const spend = Math.max(budget, actual);
   const buffer = Math.round(income * 0.10 / 10) * 10;
-  const save = Math.max(0, Math.floor((income - spend - buffer) / 50) * 50);
-  return { income, budget, actual, spend, buffer, save, months: withData.length };
+  // Just me: your share going into the joint account is already spoken for.
+  // Together: what you each put into your own accounts is already spoken for.
+  const otherKind = me ? 'joint' : 'personal';
+  const otherSaving = sum(people, m => sum(S.cats.filter(c => savingKind(c) === otherKind), c => budgetOf(c.id, m.user_id)));
+  const save = Math.max(0, Math.floor((income - spend - otherSaving - buffer) / 50) * 50);
+  return { income, budget, actual, spend, buffer, save, otherSaving, months: withData.length };
 }
 
 function updateCalc() {
@@ -643,7 +654,7 @@ function updateCalc() {
   const p = calcValues();
   box.querySelectorAll('input').forEach(i => { p[i.name] = i.type === 'checkbox' ? i.checked : (num(i.value) || 0); });
   p.salary = calcSalary();
-  const { start, salary, monthly, ...keep } = p;   // "save per month" always starts from your budgets
+  const { start, salary, monthly, target, ...keep } = p;   // "save per month" and the goal always start from your budgets and goals
   try { localStorage.setItem('nest-calc-' + S.savMode, JSON.stringify(keep)); } catch {}
 
   // Run until the goal is reached, then chart up to that point (a little past it)
@@ -657,7 +668,7 @@ function updateCalc() {
   const suggestion = !sg.income ? `<p class="note">Add your income in More → You to get a saving tip.</p>`
     : p.monthly >= sg.save ? '' : `<div class="note" style="margin-top:12px">
       <span class="tiprow">${ic('bulb', 16)}<b>You could save about ${eur0(sg.save)}/month.</b></span>
-      <div class="muted" style="margin-top:2px">That's your income minus your ${sg.actual > sg.budget ? 'usual spending' : 'budgets'}, keeping ${eur0(sg.buffer)} spare.</div>
+      <div class="muted" style="margin-top:2px">That's your income minus your ${sg.actual > sg.budget ? 'usual spending' : 'budgets'}${sg.otherSaving ? (S.savMode === 'me' ? ' and your joint account savings' : ' and your personal savings') : ''}, keeping ${eur0(sg.buffer)} spare.</div>
       ${sg.save > 0 ? `<button type="button" class="btn small" data-act="useSuggest" data-v="${sg.save}" style="margin-top:8px">Use ${eur0(sg.save)}</button>` : ''}
     </div>`;
   out.innerHTML = `
@@ -677,7 +688,7 @@ function catRow(c) {
     <div class="r1">
       <input type="hidden" name="icon" value="${esc(c.icon || 'box')}">
       <button type="button" class="iconbtn pick" data-act="nextIcon" title="Change icon" style="--c:${safeColor(c.color || '#8b93a3')}">${catIc({ icon: c.icon || 'box' }, 18)}</button>
-      <input name="name" value="${esc(c.name || '')}" placeholder="${c.id ? '' : 'New category'}" required aria-label="Name">
+      <input name="name" value="${esc(c.name || '')}" placeholder="${c.id ? '' : 'New category (optional)'}" ${c.id ? 'required' : ''} aria-label="Name">
       <input type="hidden" name="saving_kind" value="${savingKind(c) || ''}">
       <button type="button" class="iconbtn savmark ${savingKind(c) ? 'on' : ''}" data-act="toggleSavCat" title="Not savings → Personal savings → Joint savings">${ic(savingKind(c) === 'joint' ? 'users' : 'wallet', 15)}</button>
       ${c.id ? `<button type="button" class="iconbtn" data-act="delCat" data-id="${c.id}" title="Delete">${ic('trash', 16)}</button>` : '<span></span>'}
@@ -685,10 +696,25 @@ function catRow(c) {
     <div class="r2">
       ${S.members.map(m => `<label><small>${esc(m.user_id === uid() ? 'You' : m.display_name)}</small>
         <input name="b_${m.user_id}" class="money" inputmode="decimal" autocomplete="off" value="${c.id ? moneyIn(budgetOf(c.id, m.user_id)) : ''}" placeholder="€/mo"></label>`).join('')}
-      <button class="iconbtn" title="Save">${ic(c.id ? 'check' : 'plus', 16)}</button>
     </div>
   </form>`;
 }
+// Budgets are edited freely and saved together with one button.
+function markBudgetsDirty() {
+  if (S.budgetsDirty) return;
+  S.budgetsDirty = true;
+  const bar = document.querySelector('.savebar');
+  if (bar) { bar.classList.add('dirty'); bar.querySelector('.sb-text').textContent = 'Unsaved changes'; bar.querySelector('button').disabled = false; }
+}
+// Ask before throwing away unsaved budget changes. Returns true if it's OK to continue.
+function okToLeave() {
+  if (!S.budgetsDirty) return true;
+  if (!confirm('You have unsaved budget changes. Leave without saving?')) return false;
+  S.budgetsDirty = false;
+  return true;
+}
+window.addEventListener('beforeunload', e => { if (S.budgetsDirty) { e.preventDefault(); e.returnValue = ''; } });
+
 // Income minus budgets, per person, updated live while typing.
 function updateBudgetLeft() {
   if (!document.querySelector('.paygrid')) return;
@@ -746,6 +772,8 @@ function viewSettings() {
         <div class="row between left"><span>Left</span><span class="amt" id="left-${m.user_id}"></span></div>
       </div>`).join('')}</div>
     ${S.cats.map(catRow).join('')}${catRow({})}
+    <div class="savebar ${S.budgetsDirty ? 'dirty' : ''}"><span class="sb-text">${S.budgetsDirty ? 'Unsaved changes' : 'All changes saved'}</span>
+      <button type="button" class="btn small primary" data-act="saveBudgets" ${S.budgetsDirty ? '' : 'disabled'}>${ic('check', 15)} Save</button></div>
     <button class="btn" data-act="export">Export expenses (CSV, last 6 months)</button>`;
 
   return `${folders('settings', [
@@ -835,7 +863,7 @@ const PALETTE = ['#7a3e65', '#c28a2c', '#3f7d5a', '#c0573e', '#a07b3b', '#8e4a7a
 
 const ACTIONS = {
   add: () => openSheet(expenseForm()),
-  folder: d => { S.f[d.page] = d.id; render(); document.querySelector('.ftab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); },
+  folder: d => { if (d.page === 'settings' && S.f.settings !== d.id && !okToLeave()) return; S.f[d.page] = d.id; render(); document.querySelector('.ftab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); },
   edit: d => { const e = S.exp.find(x => x.id === d.id); if (e) openSheet(expenseForm(e)); },
   close: closeSheet,
   prevMonth: async () => { S.month = addMonths(S.month, -1); await refresh(); },
@@ -850,17 +878,45 @@ const ACTIONS = {
     if (!confirm('Delete this entry?')) return;
     await q(sb.from('savings').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
   },
+  saveBudgets: async () => {
+    const btn = document.querySelector('[data-act=saveBudgets]');
+    if (btn) btn.disabled = true;
+    try {
+      const all = [];
+      for (const f of document.querySelectorAll('form.catedit')) {
+        const fd = new FormData(f);
+        let id = fd.get('id');
+        const name = (fd.get('name') || '').trim();
+        if (!name) { if (id) { toast('Every category needs a name'); return; } continue; }   // empty new row: skip
+        const row = { name, icon: fd.get('icon') || 'box', saving_kind: fd.get('saving_kind') || null, is_saving: !!fd.get('saving_kind') };
+        const old = S.cats.find(c => c.id === id);
+        if (id) {
+          if (!old || old.name !== row.name || old.icon !== row.icon || (savingKind(old) || null) !== row.saving_kind)
+            await q(sb.from('categories').update(row).eq('id', id));
+        } else {
+          id = (await q(sb.from('categories').insert({ ...row, household_id: S.household.id, sort: S.cats.length + 1, color: PALETTE[S.cats.length % PALETTE.length] }).select().single())).id;
+        }
+        S.members.forEach(m => all.push({ household_id: S.household.id, category_id: id, user_id: m.user_id, amount: num(fd.get('b_' + m.user_id)) || 0 }));
+      }
+      if (all.length) await q(sb.from('budgets').upsert(all, { onConflict: 'category_id,user_id' }));
+      S.budgetsDirty = false;
+      await refresh('Budgets saved');
+    } finally { if (btn && btn.isConnected) btn.disabled = !S.budgetsDirty; }
+  },
   delCat: async d => {
-    if (!confirm('Delete this category? Its expenses become "Uncategorised".')) return;
+    if (!confirm(S.budgetsDirty ? 'Delete this category? Your other unsaved changes will be lost.' : 'Delete this category? Its expenses become "Uncategorised".')) return;
+    S.budgetsDirty = false;
     await q(sb.from('categories').delete().eq('id', d.id)); await refresh('Category deleted');
   },
   savMode: d => { S.savMode = d.mode; render(); },
+  joinTab: d => { S.joinTab = d.id; renderJoin(); },
   toggleSavCat: (d, btn) => {
     const input = btn.closest('form').querySelector('input[name=saving_kind]');
     input.value = { '': 'personal', personal: 'joint', joint: '' }[input.value] ?? '';
     btn.classList.toggle('on', !!input.value);
     btn.innerHTML = ic(input.value === 'joint' ? 'users' : 'wallet', 15);
     toast(input.value === 'joint' ? 'Joint savings (from joint deposits)' : input.value ? 'Personal savings (from your deposits)' : 'Not savings');
+    markBudgetsDirty();
     updateBudgetLeft();
   },
   nextIcon: (d, btn) => {
@@ -868,6 +924,7 @@ const ACTIONS = {
     const i = CAT_ICONS.indexOf(input.value);
     input.value = CAT_ICONS[(i + 1) % CAT_ICONS.length];
     btn.innerHTML = ic(input.value, 18);
+    markBudgetsDirty();
   },
   useSuggest: d => { const i = document.querySelector('#calc input[name=monthly]'); if (i) { i.value = moneyIn(d.v); updateCalc(); } },
   calcReset: () => { try { localStorage.removeItem('nest-calc-' + S.savMode); } catch {} if (S.calc) delete S.calc[S.savMode]; render(); },
@@ -948,22 +1005,14 @@ const FORMS = {
     }).eq('id', S.household.id));
     await loadHousehold(); await refresh('Saved');
   },
-  cat: async fd => {
-    const row = { name: fd.get('name').trim(), icon: fd.get('icon').trim() || 'box', saving_kind: fd.get('saving_kind') || null, is_saving: !!fd.get('saving_kind') };
-    let id = fd.get('id');
-    if (id) await q(sb.from('categories').update(row).eq('id', id));
-    else id = (await q(sb.from('categories').insert({ ...row, household_id: S.household.id, sort: S.cats.length + 1, color: PALETTE[S.cats.length % PALETTE.length] }).select().single())).id;
-    const budgets = S.members.map(m => ({ household_id: S.household.id, category_id: id, user_id: m.user_id, amount: num(fd.get('b_' + m.user_id)) || 0 }));
-    await q(sb.from('budgets').upsert(budgets, { onConflict: 'category_id,user_id' }));
-    await refresh(fd.get('id') ? 'Saved' : 'Category added');
-  }
+  cat: () => ACTIONS.saveBudgets()   // pressing Enter in a budget box saves everything
 };
 
 /* ───────────── Event wiring ───────────── */
 document.addEventListener('click', e => {
   const t = e.target.closest('[data-tab],[data-act]');
   if (!t) return;
-  if (t.dataset.tab) { S.tab = t.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  if (t.dataset.tab) { if (t.dataset.tab !== S.tab && !okToLeave()) return; S.tab = t.dataset.tab; render(); window.scrollTo(0, 0); return; }
   const fn = ACTIONS[t.dataset.act];
   if (fn) { e.preventDefault(); Promise.resolve(fn(t.dataset, t)).catch(err => console.error(err)); }
 });
@@ -981,7 +1030,7 @@ document.addEventListener('focusout', e => {
   const el = e.target;
   if (el.classList?.contains('money') && el.value.trim() !== '' && !isNaN(num(el.value))) el.value = moneyIn(num(el.value));
 });
-document.addEventListener('input', e => { if (e.target.name === 'includeChild') { updateCalc(); render(); return; } if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) updateBudgetLeft(); });
+document.addEventListener('input', e => { if (e.target.name === 'includeChild') { updateCalc(); render(); return; } if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) { markBudgetsDirty(); updateBudgetLeft(); } });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 init();
