@@ -1,0 +1,843 @@
+'use strict';
+/* Nest — shared expense tracker, budgets & house-savings calculator.
+   Plain JavaScript + Supabase. No build step: upload the files to GitHub Pages. */
+
+const CFG = window.APP_CONFIG || {};
+const app = document.getElementById('app');
+const sheet = document.getElementById('sheet');
+
+/* ───────────── Helpers ───────────── */
+function monthKey(d) { return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0'); }
+function addMonths(key, n) { const [y, m] = key.split('-').map(Number); return monthKey(new Date(y, m - 1 + n, 1)); }
+function daysInMonth(key) { const [y, m] = key.split('-').map(Number); return new Date(y, m, 0).getDate(); }
+function monthLabel(key, short) {
+  const [y, m] = key.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString('en-GB', short ? { month: 'short' } : { month: 'long', year: 'numeric' });
+}
+function todayStr() { const d = new Date(); return monthKey(d) + '-' + String(d.getDate()).padStart(2, '0'); }
+function fmtDate(s) { return new Date(s + 'T00:00').toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }); }
+function fmtMonthOf(d) { return d.toLocaleDateString('en-GB', { month: 'short', year: 'numeric' }); }
+function monthsUntil(dateStr) { const [y, m] = dateStr.split('-').map(Number); const n = new Date(); return (y - n.getFullYear()) * 12 + (m - 1 - n.getMonth()); }
+
+const fmt2 = new Intl.NumberFormat('el-GR', { style: 'currency', currency: 'EUR', minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmt0 = new Intl.NumberFormat('el-GR', { style: 'currency', currency: 'EUR', minimumFractionDigits: 0, maximumFractionDigits: 0 });
+const eur = n => { const v = Math.round((+n || 0) * 100) / 100; return (Number.isInteger(v) ? fmt0 : fmt2).format(v); };
+const eur0 = n => fmt0.format(Math.round(+n || 0));
+const kfmt = v => Math.abs(v) >= 10000 ? '€' + Math.round(v / 1000) + 'k' : Math.abs(v) >= 1000 ? '€' + (v / 1000).toFixed(1).replace('.0', '') + 'k' : '€' + Math.round(v);
+const num = v => parseFloat(String(v ?? '').replace(/\s/g, '').replace(',', '.'));
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const safeColor = c => /^#[0-9a-f]{3,8}$/i.test(c || '') || /^var\(--[a-z0-9-]+\)$/.test(c || '') ? c : 'var(--brand)';
+const sum = (arr, f = x => x.amount) => arr.reduce((a, x) => a + (+f(x) || 0), 0);
+const pctTxt = p => Math.round(p * 100) + '%';
+
+function toast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.remove('hidden');
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.add('hidden'), 2600);
+}
+async function q(promise) {
+  const { data, error } = await promise;
+  if (error) { console.error(error); toast(error.message); throw error; }
+  return data;
+}
+function bar(p, marker, color) {
+  const cls = p > 1 ? 'over' : p > 0.85 ? 'warn' : '';
+  const style = color ? `;background:${safeColor(color)}` : '';
+  return `<div class="bar ${color ? '' : cls}"><i style="width:${Math.max(0, Math.min(100, p * 100)).toFixed(1)}%${style}"></i>${marker != null ? `<b style="left:${(marker * 100).toFixed(1)}%"></b>` : ''}</div>`;
+}
+
+/* ───────────── Icons (thin line icons, no emoji) ───────────── */
+const ICONS = {
+  home: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><path d="M10 21v-6h4v6"/>',
+  bolt: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
+  cart: '<circle cx="9" cy="20" r="1.4"/><circle cx="18" cy="20" r="1.4"/><path d="M2 3h3l2.7 12.2a1 1 0 0 0 1 .8h9.6a1 1 0 0 0 1-.8L21 7H6"/>',
+  utensils: '<path d="M5 2v8a2 2 0 0 0 4 0V2"/><path d="M7 12v10"/><path d="M18 2c-2.2 1.5-3.5 4-3.5 7.5V13H18v9"/>',
+  paw: '<circle cx="5.5" cy="11" r="1.8"/><circle cx="9" cy="6.5" r="1.8"/><circle cx="15" cy="6.5" r="1.8"/><circle cx="18.5" cy="11" r="1.8"/><path d="M12 12c-2.8 0-5 3-5 5.5 0 1.7 1.3 2.5 2.8 2.5 1 0 1.5-.5 2.2-.5s1.2.5 2.2.5c1.5 0 2.8-.8 2.8-2.5C17 15 14.8 12 12 12z"/>',
+  car: '<path d="M3 13l2-6h14l2 6v5H3z"/><path d="M3 13h18"/><path d="M5 18v2M19 18v2"/><circle cx="7.5" cy="15.5" r=".6"/><circle cx="16.5" cy="15.5" r=".6"/>',
+  wine: '<path d="M8 2h8l-.5 6a3.5 3.5 0 0 1-7 0z"/><path d="M12 11.5V21"/><path d="M8 21h8"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-7 8-7s8 3 8 7"/>',
+  box: '<path d="M3 7.5 12 3l9 4.5v9L12 21l-9-4.5z"/><path d="M3 7.5 12 12l9-4.5"/><path d="M12 12v9"/>',
+  gift: '<rect x="3" y="8" width="18" height="4" rx="1"/><path d="M5 12v9h14v-9"/><path d="M12 8v13"/><path d="M12 8C10 4.5 6.5 4.5 7.5 7c.4 1 2.5 1 4.5 1zM12 8c2-3.5 5.5-3.5 4.5-1-.4 1-2.5 1-4.5 1z"/>',
+  heart: '<path d="M12 20s-7-4.5-9-9a5 5 0 0 1 9-3 5 5 0 0 1 9 3c-2 4.5-9 9-9 9z"/>',
+  shirt: '<path d="M8 3 3 6l2 4 2-1v12h10V9l2 1 2-4-5-3a4 4 0 0 1-8 0z"/>',
+  plane: '<path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/>',
+  phone: '<rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/>',
+  book: '<path d="M4 4h6a2 2 0 0 1 2 2v14a2 2 0 0 0-2-2H4z"/><path d="M20 4h-6a2 2 0 0 0-2 2v14a2 2 0 0 1 2-2h6z"/>',
+  dumbbell: '<path d="M6 7v10M3 9v6M18 7v10M21 9v6M6 12h12"/>',
+  coffee: '<path d="M4 8h13v5a5 5 0 0 1-5 5H9a5 5 0 0 1-5-5z"/><path d="M17 10h1.5a2.5 2.5 0 0 1 0 5H17"/><path d="M8 2v3M12 2v3"/>',
+  game: '<rect x="2" y="7" width="20" height="11" rx="4"/><path d="M7 11v3M5.5 12.5h3"/><circle cx="16" cy="11.5" r=".7"/><circle cx="18" cy="13.5" r=".7"/>',
+  health: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M12 8v8M8 12h8"/>',
+  card: '<rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/>',
+  // interface
+  chart: '<path d="M4 20V11M10 20V4M16 20v-7M21 20H3"/>',
+  wallet: '<path d="M19 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-4"/><path d="M3 7h16a2 2 0 0 1 2 2v2h-5a2 2 0 0 0 0 4h5"/>',
+  more: '<circle cx="5" cy="12" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="19" cy="12" r="1.3"/>',
+  plus: '<path d="M12 5v14M5 12h14"/>',
+  left: '<path d="M15 18l-6-6 6-6"/>',
+  right: '<path d="M9 18l6-6-6-6"/>',
+  x: '<path d="M6 6l12 12M18 6 6 18"/>',
+  trash: '<path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/>',
+  check: '<path d="M5 12.5l4.5 4.5L19 7"/>',
+  target: '<circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/>',
+  list: '<path d="M8 6h13M8 12h13M8 18h13"/><path d="M3.5 6h.01M3.5 12h.01M3.5 18h.01"/>',
+  calc: '<rect x="5" y="2" width="14" height="20" rx="2"/><path d="M8 6h8"/><path d="M8.5 11h.01M12 11h.01M15.5 11h.01M8.5 15h.01M12 15h.01M15.5 15h.01M8.5 18.5h.01M12 18.5h.01M15.5 18.5h.01"/>',
+  users: '<circle cx="9" cy="8" r="3.5"/><path d="M2.5 20c0-3.5 2.9-6 6.5-6s6.5 2.5 6.5 6"/><path d="M16 4.5a3.5 3.5 0 0 1 0 7M18 14c2 .6 3.5 2.8 3.5 6"/>',
+  clock: '<circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>',
+  alert: '<path d="M10.3 3.9 2 18a2 2 0 0 0 1.7 3h16.6a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4M12 17h.01"/>',
+  trend: '<path d="M3 17l6-6 4 4 8-8"/><path d="M15 7h6v6"/>',
+  tree: '<path d="M12 2 6 10h3l-4 6h14l-4-6h3z"/><path d="M12 16v5"/>',
+  egg: '<path d="M12 3c-3.5 0-6.5 6-6.5 10a6.5 6.5 0 0 0 13 0c0-4-3-10-6.5-10z"/>',
+  sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  down: '<path d="M12 4v14M6 12l6 6 6-6"/>',
+  up: '<path d="M12 20V6M6 12l6-6 6 6"/>',
+  bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/>',
+  logo: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><circle cx="12" cy="15" r="2.5"/>'
+};
+// Icons offered for categories (tap the icon in More → Budgets to change it)
+const CAT_ICONS = ['home', 'bolt', 'cart', 'utensils', 'paw', 'car', 'wine', 'user', 'box', 'gift', 'heart', 'shirt', 'plane', 'phone', 'book', 'dumbbell', 'coffee', 'game', 'health', 'card'];
+const ic = (name, size = 18) => `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.box}</svg>`;
+// Category icon: a line icon if it's one of ours, otherwise whatever text was saved
+const catIc = (c, size = 16) => ICONS[c.icon] ? ic(c.icon, size) : `<span>${esc(c.icon || '')}</span>`;
+const catBadge = c => `<span class="cicon" style="--c:${safeColor(c.color)}">${catIc(c)}</span>`;
+
+/* ───────────── State ───────────── */
+const S = {
+  session: null, household: null, members: [], cats: [], budgets: [], exp: [], sav: [],
+  tab: 'home', month: monthKey(new Date()), channel: null, lastCat: null, f: {}, calc: null, savMode: 'together'
+};
+const uid = () => S.session?.user?.id;
+const memberName = id => S.members.find(m => m.user_id === id)?.display_name || '—';
+const catOf = id => S.cats.find(c => c.id === id) || { name: 'Uncategorised', icon: 'box', color: '#8b93a3' };
+// Each person has their own budget amount per category.
+const budgetOf = (catId, userId = uid()) => +(S.budgets.find(b => b.category_id === catId && b.user_id === userId)?.amount || 0);
+const myBudgetTotal = () => sum(S.cats, c => budgetOf(c.id));
+// By default only what *I* paid; pass all = true for both of us.
+const monthExp = (key = S.month, all = false) => S.exp.filter(e => e.spent_on.startsWith(key) && (all || e.paid_by === uid()));
+const isTyping = () => { const a = document.activeElement; return a && app.contains(a) && /INPUT|SELECT|TEXTAREA/.test(a.tagName); };
+
+/* ───────────── Startup ───────────── */
+if (!CFG.url || CFG.url.includes('YOUR-PROJECT')) {
+  app.innerHTML = `<div class="card center"><div class="logo">${ic('logo', 28)}</div><h1>Almost there</h1>
+    <p class="muted">Open <code>config.js</code> and paste your Supabase project URL and anon key.</p></div>`;
+  throw new Error('Missing Supabase config');
+}
+const sb = supabase.createClient(CFG.url, CFG.key);
+
+async function init() {
+  const { data } = await sb.auth.getSession();
+  S.session = data.session;
+  sb.auth.onAuthStateChange((_ev, session) => {
+    const changed = session?.user?.id !== S.session?.user?.id;
+    S.session = session;
+    if (changed) setTimeout(boot, 0); // never await Supabase inside this callback
+  });
+  boot();
+}
+
+async function boot() {
+  try {
+    if (!S.session) return renderAuth();
+    await loadHousehold();
+    if (!S.household) return renderJoin();
+    await loadData();
+    subscribe();
+    render();
+  } catch (e) {
+    app.innerHTML = `<div class="card center"><p>Couldn't load: ${esc(e.message)}</p>
+      <p class="muted">Check your internet connection.</p><button class="btn primary" onclick="location.reload()">Try again</button></div>`;
+  }
+}
+
+async function loadHousehold() {
+  const mine = await q(sb.from('members').select('household_id').eq('user_id', uid()).limit(1));
+  if (!mine.length) { S.household = null; return; }
+  const hid = mine[0].household_id;
+  S.household = await q(sb.from('households').select('*').eq('id', hid).single());
+  S.members = await q(sb.from('members').select('*').eq('household_id', hid).order('joined_at'));
+}
+
+// Loads 6 months ending with the month on screen (enough for the stats trend).
+async function loadData() {
+  const hid = S.household.id;
+  const from = addMonths(S.month, -5) + '-01', to = addMonths(S.month, 1) + '-01';
+  const [cats, budgets, exp, sav, members] = await Promise.all([
+    q(sb.from('categories').select('*').eq('household_id', hid).order('sort').order('name')),
+    q(sb.from('budgets').select('*').eq('household_id', hid)),
+    q(sb.from('expenses').select('*').eq('household_id', hid).gte('spent_on', from).lt('spent_on', to)
+      .order('spent_on', { ascending: false }).order('created_at', { ascending: false })),
+    q(sb.from('savings').select('*').eq('household_id', hid).order('saved_on', { ascending: false }).order('created_at', { ascending: false })),
+    q(sb.from('members').select('*').eq('household_id', hid).order('joined_at'))
+  ]);
+  Object.assign(S, { cats, budgets, exp, sav, members });
+}
+
+let reloadTimer;
+function scheduleReload() {
+  clearTimeout(reloadTimer);
+  reloadTimer = setTimeout(async () => {
+    try { await loadData(); if (!isTyping()) render(); } catch {}
+  }, 500);
+}
+function subscribe() {
+  if (S.channel) sb.removeChannel(S.channel);
+  S.channel = sb.channel('nest-' + S.household.id)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'expenses' }, scheduleReload)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'savings' }, scheduleReload)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, scheduleReload)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'budgets' }, scheduleReload)
+    .subscribe();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.household) scheduleReload();
+});
+
+/* ───────────── Auth & joining ───────────── */
+function renderAuth() {
+  app.innerHTML = `<div class="card center">
+    <div class="logo">${ic('logo', 28)}</div><h1>Nest</h1>
+    <p class="muted">Track spending and save for our home, together.</p>
+    <form data-form="auth" class="stack" style="margin-top:16px">
+      <input name="email" type="email" placeholder="Email" autocomplete="email" required>
+      <input name="password" type="password" placeholder="Password (min 6 characters)" autocomplete="current-password" minlength="6" required>
+      <button class="btn primary" name="mode" value="in">Sign in</button>
+      <button class="btn" name="mode" value="up">Create account</button>
+    </form>
+    <p class="muted" id="authmsg"></p>
+  </div>`;
+}
+function renderJoin() {
+  app.innerHTML = `<div class="view">
+    <h1>Welcome</h1>
+    <p class="muted">One of you creates the household, the other joins with the invite code.</p>
+    <div class="card"><h2>Create a household</h2>
+      <form data-form="create" class="stack">
+        <input name="name" placeholder="Your name" required>
+        <input name="hname" placeholder="Household name" value="Our home">
+        <button class="btn primary">Create</button>
+      </form></div>
+    <div class="card"><h2>Join your partner</h2>
+      <form data-form="join" class="stack">
+        <input name="name" placeholder="Your name" required>
+        <input name="code" placeholder="Invite code (e.g. A1B2C3)" autocapitalize="characters" required>
+        <button class="btn primary">Join</button>
+      </form></div>
+    <button class="btn danger" data-act="signout">Sign out</button>
+  </div>`;
+}
+
+/* ───────────── Main render ───────────── */
+const TABS = [['home', 'home', 'Home'], ['stats', 'chart', 'Stats'], ['add'], ['savings', 'wallet', 'Savings'], ['settings', 'more', 'More']];
+function render() {
+  const view = { home: viewHome, stats: viewStats, savings: viewSavings, settings: viewSettings }[S.tab]();
+  app.innerHTML = `<main class="view view-${S.tab}">${view}</main>
+    <nav class="tabs">${TABS.map(([k, i, l]) => k === 'add'
+      ? `<button class="tab add" data-act="add" aria-label="Add expense">${ic('plus', 24)}</button>`
+      : `<button class="tab ${S.tab === k ? 'on' : ''}" data-tab="${k}">${ic(i, 21)}<small>${l}</small></button>`).join('')}</nav>`;
+  updateCalc();
+  updateBudgetLeft();
+}
+
+function monthNav() {
+  const now = monthKey(new Date());
+  return `<div class="monthnav"><button data-act="prevMonth" aria-label="Previous month">${ic('left')}</button>
+    <h1>${monthLabel(S.month)}</h1>
+    <button data-act="nextMonth" aria-label="Next month" ${S.month >= now ? 'disabled' : ''}>${ic('right')}</button></div>`;
+}
+
+function catTotals(ex) {
+  const t = {};
+  ex.forEach(e => { const k = e.category_id || 'none'; t[k] = (t[k] || 0) + (+e.amount); });
+  return t;
+}
+
+function expItem(e) {
+  const c = catOf(e.category_id);
+  return `<div class="item" data-act="edit" data-id="${e.id}">
+    ${catBadge(c)}
+    <div class="grow"><div class="ellipsis">${esc(e.note || c.name)}</div>
+      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}</div></div>
+    <div class="amt">${eur(e.amount)}</div></div>`;
+}
+
+/* ───────────── Folder tabs ───────────── */
+// Each screen's sections live in notebook-style folder tabs, so there's less scrolling.
+// items: [{ id, label, color, dot?, body: () => html }]
+function folders(page, items, title) {
+  let cur = S.f[page];
+  if (!items.some(i => i.id === cur)) cur = S.f[page] = items[0].id;
+  const it = items.find(i => i.id === cur);
+  return `<div class="folders ${title ? 'titled' : ''}"><div class="fhead">${title ? `<h1>${title}</h1>` : ''}<div class="ftabs">${items.map(i =>
+      `<button class="ftab ${i.id === cur ? 'on' : ''}" style="--c:${i.color}" data-act="folder" data-page="${page}" data-id="${i.id}">${i.label}${i.dot ? `<i class="dot ${i.dot}"></i>` : ''}</button>`).join('')}</div></div>
+    <div class="fbody">${it.body()}</div></div>`;
+}
+
+
+/* ───────────── Home ───────────── */
+function viewHome() {
+  const now = monthKey(new Date()), isNow = S.month === now;
+  const dim = daysInMonth(S.month), day = new Date().getDate();
+  const daysLeft = isNow ? dim - day + 1 : 0;
+  const pace = isNow ? day / dim : 1;
+
+  const ex = monthExp(), t = catTotals(ex);
+  const spent = sum(ex), budget = myBudgetTotal(), left = budget - spent;
+  const perDay = isNow ? Math.max(0, left) / daysLeft : null;
+
+  const rows = S.cats.map(c => ({ c, spent: t[c.id] || 0, budget: budgetOf(c.id) })).filter(r => r.budget || r.spent);
+  if (t.none) rows.push({ c: catOf(null), spent: t.none, budget: 0 });
+  const ratio = r => r.budget ? r.spent / r.budget : (r.spent ? 9 : 0);
+  rows.sort((a, b) => ratio(b) - ratio(a));
+
+  const over = rows.filter(r => r.budget && r.spent > r.budget);
+  const fast = isNow ? rows.filter(r => r.budget && r.spent < r.budget && r.spent / r.budget > 0.5 && r.spent / r.budget > pace + 0.2) : [];
+
+  const budgetsBody = () => rows.length ? rows.map(r => {
+      const isOver = r.budget ? r.spent > r.budget : r.spent > 0;
+      const isFast = fast.includes(r);
+      const badge = isOver
+        ? `<div class="badge bad">${ic('alert', 13)} ${r.budget ? `Over budget by ${eur0(r.spent - r.budget)}` : 'No budget set'}</div>`
+        : isFast ? `<div class="badge warn">${ic('clock', 13)} Slow down: only ${eur0(r.budget - r.spent)} left for ${daysLeft} days</div>` : '';
+      return `<div class="cat ${isOver ? 'hl bad' : isFast ? 'hl warn' : ''}">
+        <div class="row between"><span class="cname">${catIc(r.c)} ${esc(r.c.name)}</span>
+          <span class="amt">${eur0(r.spent)}<span class="muted"> / ${r.budget ? eur0(r.budget) : '—'}</span></span></div>
+        ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : 'var(--brand)')}${badge}</div>`;
+    }).join('')
+    : '<div class="empty">You have no budgets yet. Set them in More → Budgets.</div>';
+
+  const expensesBody = () => `<div class="list">${ex.length ? ex.map(expItem).join('') : '<div class="empty">Nothing yet. Tap + to add an expense.</div>'}</div>`;
+
+  return `${monthNav()}
+  <div class="card">
+    <div class="row between muted"><span>You spent this month</span><span>Your budget ${eur0(budget)}</span></div>
+    <div class="big">${eur(spent)}</div>
+    ${bar(budget ? spent / budget : 0)}
+    <div class="grid3">
+      <div class="stat"><b class="${left < 0 ? 'neg' : ''}">${eur0(left)}</b><span>${left < 0 ? 'Over budget' : 'Left to spend'}</span></div>
+      <div class="stat"><b>${perDay != null ? eur0(perDay) : '—'}</b><span>Can spend / day</span></div>
+      <div class="stat"><b>${isNow ? daysLeft : '—'}</b><span>${isNow ? (daysLeft === 1 ? 'Day left' : 'Days left') : 'Month ended'}</span></div>
+    </div>
+  </div>
+  ${folders('home', [
+    { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', dot: over.length ? 'over' : fast.length ? 'warn' : '', body: budgetsBody },
+    { id: 'expenses', label: `${ic('list', 14)} Expenses`, color: 'var(--brand)', body: expensesBody }
+  ])}`;
+}
+
+/* ───────────── Stats ───────────── */
+function vbars(items, line) {
+  const W = 320, H = 140, L = 6;
+  const max = Math.max(line || 0, ...items.map(i => i.value), 1) * 1.12;
+  const bw = (W - L) / items.length;
+  let s = `<svg class="chart" viewBox="0 0 ${W} ${H + 18}">`;
+  items.forEach((it, i) => {
+    const h = it.value / max * H, x = L + i * bw + bw * 0.15, cx = x + bw * 0.35;
+    s += `<rect x="${x.toFixed(1)}" y="${(H - h).toFixed(1)}" width="${(bw * 0.7).toFixed(1)}" height="${h.toFixed(1)}" rx="4" class="${it.hi ? 'hi' : ''}"/>
+      <text x="${cx.toFixed(1)}" y="${H + 13}" text-anchor="middle">${esc(it.label)}</text>
+      ${it.value ? `<text class="v" x="${cx.toFixed(1)}" y="${(H - h - 4).toFixed(1)}" text-anchor="middle">${kfmt(it.value)}</text>` : ''}`;
+  });
+  if (line) { const y = (H - line / max * H).toFixed(1); s += `<line class="budget" x1="${L}" x2="${W}" y1="${y}" y2="${y}"/>`; }
+  return s + '</svg>';
+}
+
+function viewStats() {
+  const ex = monthExp(), prevKey = addMonths(S.month, -1), prev = monthExp(prevKey);
+  const spent = sum(ex), prevSpent = sum(prev), budget = myBudgetTotal();
+  const t = catTotals(ex), tp = catTotals(prev);
+  const isNow = S.month === monthKey(new Date());
+  const days = isNow ? new Date().getDate() : daysInMonth(S.month);
+  const diffTotal = spent - prevSpent;
+
+  const trendBody = () => {
+    const months = [...Array(6)].map((_, i) => addMonths(S.month, i - 5));
+    const trend = months.map(k => ({ label: monthLabel(k, true), value: sum(monthExp(k)), hi: k === S.month }));
+    const withData = trend.filter(x => x.value);
+    const avg = withData.length ? sum(withData, x => x.value) / withData.length : 0;
+    return `${vbars(trend, budget)}<p class="muted">Average ${eur0(avg)} a month. The dashed line is your monthly budget (${eur0(budget)}).</p>`;
+  };
+
+  const compareBody = () => {
+    const changes = S.cats.map(c => ({ c, now: t[c.id] || 0, prev: tp[c.id] || 0 }))
+      .map(x => ({ ...x, d: x.now - x.prev })).filter(x => Math.abs(x.d) >= 1)
+      .sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
+    return `<p class="muted" style="margin-top:0">${monthLabel(S.month, true)} compared with ${monthLabel(prevKey, true)}</p>` +
+      (changes.length ? changes.map(x => `<div class="row between cat"><span class="cname">${catIc(x.c)} ${esc(x.c.name)}</span>
+        <span class="amt ${x.d > 0 ? 'neg' : 'pos'}">${x.d > 0 ? ic('up', 13) + ' +' : ic('down', 13) + ' '}${eur0(x.d)}</span></div>`).join('') : '<div class="empty">No change yet</div>');
+  };
+
+  const whoBody = () => {
+    const all = monthExp(S.month, true), total = sum(all);
+    const people = S.members.map(m => ({ m, v: sum(all.filter(e => e.paid_by === m.user_id)), b: sum(S.cats, c => budgetOf(c.id, m.user_id)) }));
+    return `<p class="muted" style="margin-top:0">Together ${eur0(total)} this month</p>
+      ${people.map(p => `<div class="cat"><div class="row between"><span>${esc(p.m.display_name)}</span>
+        <span class="amt">${eur0(p.v)} <span class="muted">/ ${eur0(p.b)}</span></span></div>
+        ${bar(p.b ? p.v / p.b : 0)}</div>`).join('')}`;
+  };
+
+  const topBody = () => {
+    const top = [...ex].sort((a, b) => b.amount - a.amount).slice(0, 6);
+    return `<div class="list">${top.length ? top.map(expItem).join('') : '<div class="empty">—</div>'}</div>`;
+  };
+
+  return `${monthNav()}
+  <div class="card"><div class="grid3" style="margin-top:0">
+    <div class="stat"><b>${eur0(spent)}</b><span>Spent</span></div>
+    <div class="stat"><b>${eur0(spent / days)}</b><span>Per day</span></div>
+    <div class="stat"><b class="${diffTotal > 0 ? 'neg' : 'pos'}">${prevSpent ? (diffTotal > 0 ? '+' : '') + eur0(diffTotal) : '—'}</b><span>vs last month</span></div>
+  </div></div>
+  <div class="card"><h2>Last 6 months</h2>${trendBody()}</div>
+  <div class="card"><h2>Compared with last month</h2>${compareBody()}</div>
+  <div class="card"><h2>You and your partner</h2>${whoBody()}</div>
+  <div class="card"><h2>Biggest expenses</h2>${topBody()}</div>`;
+}
+
+/* ───────────── Savings + calculator ───────────── */
+// The "Just me / Together" toggle changes the whole Savings screen, calculator included.
+function savingsView() {
+  const me = S.savMode === 'me';
+  const list = me ? S.sav.filter(s => s.saved_by === uid()) : S.sav;
+  const meRow = S.members.find(m => m.user_id === uid()) || {};
+  const goal = me ? +meRow.savings_goal || 0 : +S.household.savings_goal || 0;
+  const goalDate = me ? (meRow.goal_date || S.household.goal_date) : S.household.goal_date;
+  return { me, list, total: sum(list), goal, goalDate };
+}
+
+function viewSavings() {
+  const h = S.household, v = savingsView();
+  const thisMonth = sum(v.list.filter(s => s.saved_on.startsWith(monthKey(new Date()))));
+  const ml = v.goalDate ? monthsUntil(v.goalDate) : null;
+  const need = v.goal && ml > 0 ? Math.max(0, v.goal - v.total) / ml : null;
+
+  const whoBody = () => {
+    const people = S.members.map(m => ({ m, v: sum(S.sav.filter(s => s.saved_by === m.user_id)) }));
+    return people.map(p => `<div class="cat"><div class="row between"><span>${esc(p.m.display_name)}</span><span class="amt">${eur0(p.v)}</span></div>
+      ${bar(v.total > 0 ? p.v / v.total : 0, null, 'var(--brand)')}</div>`).join('');
+  };
+  const historyBody = () => `<div class="list">${v.list.length ? v.list.slice(0, 60).map(s => `<div class="item" data-act="editSaving" data-id="${s.id}">
+      <span class="cicon" style="--c:${s.amount > 0 ? 'var(--ok)' : 'var(--bad)'}">${ic(s.amount > 0 ? 'down' : 'up', 16)}</span>
+      <div class="grow"><div class="ellipsis">${esc(s.note || (s.amount > 0 ? 'Deposit' : 'Withdrawal'))}</div>
+        <div class="muted">${fmtDate(s.saved_on)} · ${esc(memberName(s.saved_by))}</div></div>
+      <div class="amt ${s.amount > 0 ? 'pos' : 'neg'}">${s.amount > 0 ? '+' : ''}${eur(s.amount)}</div></div>`).join('')
+    : '<div class="empty">Log what you put aside each month, and your starting savings.</div>'}</div>`;
+
+  const tabs = [{ id: 'calc', label: `${ic('calc', 14)} Calculator`, color: 'var(--brand)', body: calcBody }];
+  if (!v.me) tabs.push({ id: 'who', label: `${ic('users', 14)} Who saved`, color: 'var(--brand)', body: whoBody });
+  tabs.push({ id: 'history', label: `${ic('clock', 14)} History`, color: 'var(--brand)', body: historyBody });
+
+  return `<div class="titlerow"><h1>Savings</h1>
+    <div class="seg compact">
+      <label data-act="savMode" data-mode="me"><input type="radio" name="savmode" ${v.me ? 'checked' : ''}><span>${ic('user', 14)} Just me</span></label>
+      <label data-act="savMode" data-mode="together"><input type="radio" name="savmode" ${v.me ? '' : 'checked'}><span>${ic('users', 14)} Together</span></label>
+    </div></div>
+  <div class="card">
+    <div class="muted">${v.me ? 'You saved so far' : 'Saved together so far'}</div>
+    <div class="big">${eur(v.total)}</div>
+    ${v.goal ? `${bar(v.total / v.goal, null, 'var(--brand)')}
+      <div class="row between muted" style="margin-top:6px"><span>${pctTxt(v.total / v.goal)} of ${eur0(v.goal)}</span>
+      <span>${v.goalDate ? 'by ' + fmtMonthOf(new Date(v.goalDate + 'T00:00')) : ''}</span></div>`
+      : `<p class="muted">${v.me ? 'Set your own goal in More → You.' : 'Set a goal and date in More → Household.'}</p>`}
+    <div class="grid3">
+      <div class="stat"><b>${eur0(thisMonth)}</b><span>This month</span></div>
+      <div class="stat"><b>${need != null ? eur0(need) : '—'}</b><span>Needed / month</span></div>
+      <div class="stat"><b>${ml != null ? Math.max(0, ml) : '—'}</b><span>Months left</span></div>
+    </div>
+    <div class="grid2"><button class="btn primary" data-act="addSaving" data-kind="in">${ic('plus', 16)} Deposit</button>
+      <button class="btn" data-act="addSaving" data-kind="out">Withdraw</button></div>
+  </div>
+  ${folders('savings', tabs)}`;
+}
+
+// Separate calculator settings for "Just me" and "Together". "Saved now" always starts from the real savings.
+const CALC_DEFAULTS = {
+  me: { monthly: 1400, months: 24, xmas: true, easter: true, summer: true },
+  together: { monthly: 2000, months: 24, xmas: true, easter: true, summer: true }
+};
+function calcValues() {
+  const mode = S.savMode, v = savingsView();
+  S.calc = S.calc || {};
+  if (!S.calc[mode]) {
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem('nest-calc-' + mode) || '{}'); } catch {}
+    S.calc[mode] = { ...CALC_DEFAULTS[mode], target: v.goal || 100000, ...saved, start: Math.round(v.total) };
+  }
+  return S.calc[mode];
+}
+const calcField = (k, label) => `<div><label class="f">${label}</label><input name="${k}" type="number" inputmode="decimal" step="any" value="${calcValues()[k]}"></div>`;
+
+// Monthly income of whoever the Savings screen is showing (you, or both of you).
+const calcSalary = () => sum(S.savMode === 'me' ? S.members.filter(m => m.user_id === uid()) : S.members, m => m.monthly_income);
+
+function calcBody() {
+  const p = calcValues(), sal = calcSalary();
+  const row = (k, icon, label, x) => `<label class="bonusrow"><span class="bi">${icon}</span>
+      <span class="grow">${label}<small>${x === 1 ? 'One full salary' : 'Half a salary'}</small></span>
+      <span class="amt">${sal ? eur0(sal * x) : ''}</span>
+      <input type="checkbox" class="switch" name="${k}" ${p[k] ? 'checked' : ''}></label>`;
+  return `<div id="calc">
+    <div class="grid2">
+      ${calcField('start', 'Saved now (€)')}${calcField('monthly', 'Save per month (€)')}
+      ${calcField('months', 'For how many months')}${calcField('target', 'Target (€)')}
+    </div>
+    <label class="f">Bonuses we'll save</label>
+    <div class="bonuses">${row('xmas', ic('tree', 18), 'Christmas', 1)}${row('easter', ic('egg', 18), 'Easter', 0.5)}${row('summer', ic('sun', 18), 'Summer', 0.5)}</div>
+    ${sal ? '' : '<p class="muted">Add your income in More → You to count bonuses.</p>'}
+    <button type="button" class="btn small" data-act="calcReset" style="margin-top:12px">Reset</button>
+    <div id="calc-out"></div></div>`;
+}
+
+// Month-by-month projection. Greek bonuses: a full salary at Christmas (Dec), half at Easter (Apr), half in summer (Jun).
+function simulate(p, months) {
+  const now = new Date();
+  let bal = +p.start, added = 0, hit = (p.target > 0 && bal >= p.target) ? 0 : null;
+  const pts = [{ bal, d: null }];
+  for (let i = 1; i <= months; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() + i, 1), mo = d.getMonth();
+    const sal = p.salary || 0;
+    const bonus = (mo === 11 && p.xmas ? sal : 0) + (mo === 3 && p.easter ? sal / 2 : 0) + (mo === 5 && p.summer ? sal / 2 : 0);
+    added += p.monthly + bonus;
+    bal += p.monthly + bonus;
+    pts.push({ bal, d });
+    if (hit == null && p.target > 0 && bal >= p.target) hit = i;
+  }
+  return { bal, pts, added, hit };
+}
+
+function lineChart(pts, target) {
+  const W = 320, H = 160, L = 40, B = 18, T = 8;
+  const maxY = Math.max(target || 0, ...pts.map(p => p.bal)) * 1.05 || 1;
+  const n = pts.length - 1 || 1;
+  const x = i => L + (W - L - 8) * i / n, y = v => T + (H - T - B) * (1 - v / maxY);
+  const d = pts.map((p, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(p.bal).toFixed(1)}`).join('');
+  const area = `${d}L${x(pts.length - 1).toFixed(1)},${y(0)}L${x(0)},${y(0)}Z`;
+  let g = '';
+  [0, 0.5, 1].forEach(f => { const v = maxY / 1.05 * f, yy = y(v).toFixed(1);
+    g += `<line class="grid" x1="${L}" x2="${W}" y1="${yy}" y2="${yy}"/><text x="${L - 4}" y="${(+yy + 3).toFixed(1)}" text-anchor="end">${kfmt(v)}</text>`; });
+  const idx = [...new Set([0, Math.round(n / 2), pts.length - 1])];
+  const labels = idx.map(i => `<text x="${x(i).toFixed(1)}" y="${H - 3}" text-anchor="${i === 0 ? 'start' : i === pts.length - 1 ? 'end' : 'middle'}">${pts[i].d ? fmtMonthOf(pts[i].d) : 'Now'}</text>`).join('');
+  const tl = target > 0 ? `<line class="target" x1="${L}" x2="${W}" y1="${y(target).toFixed(1)}" y2="${y(target).toFixed(1)}"/>` : '';
+  return `<svg class="chart" viewBox="0 0 ${W} ${H}">${g}<path class="area" d="${area}"/><path class="line" d="${d}"/>${tl}${labels}</svg>`;
+}
+
+// Suggested monthly saving: take-home pay − what you really spend (your budgets, or your
+// actual average if that's higher) − 10% of pay kept free as spending money.
+function suggestSaving() {
+  const me = S.savMode === 'me';
+  const people = me ? S.members.filter(m => m.user_id === uid()) : S.members;
+  const income = sum(people, m => m.monthly_income);
+  const budget = sum(people, m => sum(S.cats, c => budgetOf(c.id, m.user_id)));
+  const nowKey = monthKey(new Date());
+  const past = [1, 2, 3].map(i => addMonths(nowKey, -i)).map(k => sum(monthExp(k, !me)));
+  const withData = past.filter(v => v > 0);
+  const actual = withData.length ? sum(withData, v => v) / withData.length : 0;
+  const spend = Math.max(budget, actual);
+  const buffer = Math.round(income * 0.10 / 10) * 10;
+  const save = Math.max(0, Math.floor((income - spend - buffer) / 50) * 50);
+  return { income, budget, actual, spend, buffer, save, months: withData.length };
+}
+
+function updateCalc() {
+  const box = document.getElementById('calc'), out = document.getElementById('calc-out');
+  if (!box || !out) return;
+  const p = calcValues();
+  box.querySelectorAll('input').forEach(i => { p[i.name] = i.type === 'checkbox' ? i.checked : (num(i.value) || 0); });
+  p.salary = calcSalary();
+  const { start, salary, ...keep } = p;
+  try { localStorage.setItem('nest-calc-' + S.savMode, JSON.stringify(keep)); } catch {}
+
+  const months = Math.min(600, Math.max(1, Math.round(p.months)));
+  const sim = simulate(p, months);
+  const reach = p.target > 0 ? simulate(p, 600).hit : null;
+  const reachDate = reach ? fmtMonthOf(new Date(new Date().getFullYear(), new Date().getMonth() + reach, 1)) : '';
+  const sg = suggestSaving();
+  const suggestion = !sg.income ? `<p class="note">Add your income in More → You to get a saving tip.</p>`
+    : p.monthly >= sg.save ? '' : `<div class="note" style="margin-top:12px">
+      <span class="tiprow">${ic('bulb', 16)}<b>You could save about ${eur0(sg.save)}/month.</b></span>
+      <div class="muted" style="margin-top:2px">That's your income minus your ${sg.actual > sg.budget ? 'usual spending' : 'budgets'}, keeping ${eur0(sg.buffer)} spare.</div>
+      ${sg.save > 0 ? `<button type="button" class="btn small" data-act="useSuggest" data-v="${sg.save}" style="margin-top:8px">Use ${eur0(sg.save)}</button>` : ''}
+    </div>`;
+  out.innerHTML = `
+    <div class="grid2" style="margin-top:14px">
+      <div class="stat"><b>${eur0(sim.bal)}</b><span>${S.savMode === 'me' ? 'You will have' : 'You will have together'} in ${months} months</span></div>
+      <div class="stat"><b>+${eur0(sim.added)}</b><span>Added by saving</span></div>
+    </div>
+    ${lineChart(sim.pts, p.target)}
+    <p class="muted">${p.target > 0 ? (reach === 0 ? 'You already have the target.'
+      : reach ? `${eur0(p.target)} reached in <b>${reach} months</b> (${reachDate}).`
+      : 'Target not reached in 50 years. Try saving more per month.') : ''}</p>
+` + suggestion;
+}
+
+/* ───────────── Settings ───────────── */
+function catRow(c) {
+  return `<form data-form="cat" class="catedit">
+    <input type="hidden" name="id" value="${c.id || ''}">
+    <div class="r1">
+      <input type="hidden" name="icon" value="${esc(c.icon || 'box')}">
+      <button type="button" class="iconbtn pick" data-act="nextIcon" title="Change icon" style="--c:${safeColor(c.color || '#8b93a3')}">${catIc({ icon: c.icon || 'box' }, 18)}</button>
+      <input name="name" value="${esc(c.name || '')}" placeholder="${c.id ? '' : 'New category'}" required aria-label="Name">
+      ${c.id ? `<button type="button" class="iconbtn" data-act="delCat" data-id="${c.id}" title="Delete">${ic('trash', 16)}</button>` : '<span></span>'}
+    </div>
+    <div class="r2">
+      ${S.members.map(m => `<label><small>${esc(m.user_id === uid() ? 'You' : m.display_name)}</small>
+        <input name="b_${m.user_id}" type="number" inputmode="decimal" step="any" value="${c.id ? (budgetOf(c.id, m.user_id) || '') : ''}" placeholder="€/mo"></label>`).join('')}
+      <button class="iconbtn" title="Save">${ic(c.id ? 'check' : 'plus', 16)}</button>
+    </div>
+  </form>`;
+}
+// Income minus budgets, per person, updated live while typing.
+function updateBudgetLeft() {
+  if (!document.querySelector('.paygrid')) return;
+  S.members.forEach(m => {
+    const pay = +m.monthly_income || 0;
+    let acc = 0;
+    document.querySelectorAll('form.catedit').forEach(f => {
+      if (!f.querySelector('input[name=id]').value) return;
+      acc += num(f.querySelector(`input[name="b_${m.user_id}"]`)?.value) || 0;
+    });
+    document.getElementById('bud-' + m.user_id).textContent = eur0(acc);
+    const l = document.getElementById('left-' + m.user_id);
+    l.textContent = pay ? eur0(pay - acc) : 'Add income';
+    l.classList.toggle('neg', pay - acc < 0);
+  });
+}
+
+function viewSettings() {
+  const me = S.members.find(m => m.user_id === uid()) || {}, h = S.household;
+  const youBody = () => `<form data-form="profile">
+      <label class="f">Name</label><input name="display_name" value="${esc(me.display_name)}" required>
+      <label class="f">Monthly income, after tax (€)</label>
+      <input name="monthly_income" type="number" inputmode="decimal" step="any" value="${+me.monthly_income || ''}">
+      <label class="f">My own savings goal (€)</label>
+      <input name="savings_goal" type="number" inputmode="decimal" step="any" value="${+me.savings_goal || ''}" placeholder="e.g. 60000">
+      <label class="f">My goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}">
+      <button class="btn primary">Save</button>
+    </form>
+    <p class="muted">Signed in as ${esc(S.session.user.email)}</p>
+    <button class="btn danger" data-act="signout">Sign out</button>`;
+  const homeBody = () => `<form data-form="household">
+      <label class="f">Name</label><input name="name" value="${esc(h.name)}" required>
+      <label class="f">Savings goal together (€)</label>
+      <input name="savings_goal" type="number" inputmode="decimal" step="any" value="${+h.savings_goal || ''}" placeholder="e.g. 100000">
+      <label class="f">Goal date together</label><input name="goal_date" type="date" value="${h.goal_date || ''}">
+      <button class="btn primary">Save</button>
+    </form>
+    <label class="f">Invite code: your partner enters this after creating an account</label>
+    <div class="row between"><span class="code">${esc(h.invite_code)}</span><button class="btn small" data-act="copyCode">Copy</button></div>
+    <p class="muted">Members: ${S.members.map(m => esc(m.display_name)).join(', ')}</p>`;
+  const budgetsBody = () => `<div class="paygrid">${S.members.map(m => `<div class="paybox">
+        <div class="t1">${esc(m.user_id === uid() ? 'You' : m.display_name)}</div>
+        <div class="row between"><span>Income</span><span class="amt">${+m.monthly_income ? eur0(m.monthly_income) : '—'}</span></div>
+        <div class="row between"><span>Budgets</span><span class="amt" id="bud-${m.user_id}"></span></div>
+        <div class="row between left"><span>Left</span><span class="amt" id="left-${m.user_id}"></span></div>
+      </div>`).join('')}</div>
+    ${S.cats.map(catRow).join('')}${catRow({})}
+    <button class="btn" data-act="export">Export expenses (CSV, last 6 months)</button>`;
+
+  return `${folders('settings', [
+    { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', body: budgetsBody },
+    { id: 'you', label: `${ic('user', 14)} You`, color: 'var(--brand)', body: youBody },
+    { id: 'home', label: `${ic('home', 14)} Household`, color: 'var(--brand)', body: homeBody }
+  ], 'More')}`;
+}
+
+/* ───────────── Sheets (forms that slide up) ───────────── */
+// Freeze the page behind a form so it can't scroll (works on iPhone too).
+function lockPage() {
+  if (document.body.classList.contains('locked')) return;
+  lockPage.y = window.scrollY;
+  document.body.style.top = `-${lockPage.y}px`;
+  document.body.classList.add('locked');
+}
+function unlockPage() {
+  if (!document.body.classList.contains('locked')) return;
+  document.body.classList.remove('locked');
+  document.body.style.top = '';
+  window.scrollTo(0, lockPage.y || 0);
+}
+
+function openSheet(html) {
+  lockPage();
+  sheet.innerHTML = `<div class="backdrop" data-act="close"></div><div class="panel">${html}</div>`;
+  sheet.classList.remove('hidden');
+  requestAnimationFrame(() => requestAnimationFrame(() => sheet.classList.add('open')));
+  setTimeout(() => sheet.querySelector('[autofocus]')?.focus(), 80);
+}
+function closeSheet() {
+  sheet.classList.remove('open');
+  unlockPage();
+  setTimeout(() => { sheet.classList.add('hidden'); sheet.innerHTML = ''; }, 250);
+}
+// One-tap toggle for who paid / who saved. The signed-in person comes first and is preselected.
+const whoToggle = (name, sel = uid()) => `<div class="seg">${[...S.members].sort((a, b) => (b.user_id === uid()) - (a.user_id === uid())).map(m =>
+  `<label><input type="radio" name="${name}" value="${m.user_id}" ${m.user_id === sel ? 'checked' : ''}><span>${m.user_id === uid() ? 'Me' : esc(m.display_name)}</span></label>`).join('')}</div>`;
+
+function expenseForm(e = {}) {
+  const sel = e.category_id || S.lastCat || S.cats[0]?.id;
+  return `<form data-form="expense" class="stack">
+    <div class="sheet-head"><h3>${e.id ? 'Edit expense' : 'New expense'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <input type="hidden" name="id" value="${e.id || ''}">
+    <input class="amount" name="amount" inputmode="decimal" placeholder="€0" value="${e.amount ?? ''}" required autofocus autocomplete="off">
+    <div class="chips">${S.cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
+    <input name="note" placeholder="Note (e.g. souvlaki, Lidl)" value="${esc(e.note || '')}" maxlength="120">
+    <input type="date" name="spent_on" value="${e.spent_on || todayStr()}" required>
+    ${whoToggle('paid_by', e.paid_by || uid())}
+    <button class="btn primary">${e.id ? 'Save' : 'Add expense'}</button>
+    ${e.id ? `<button type="button" class="btn danger" data-act="delExpense" data-id="${e.id}">Delete</button>` : ''}
+  </form>`;
+}
+function savingForm(s = {}, kind = 'in') {
+  const k = s.amount != null ? (s.amount < 0 ? 'out' : 'in') : kind;
+  return `<form data-form="saving" class="stack">
+    <div class="sheet-head"><h3>${s.id ? 'Edit' : k === 'in' ? 'Add to savings' : 'Take from savings'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <input type="hidden" name="id" value="${s.id || ''}">
+    <div class="seg"><label><input type="radio" name="kind" value="in" ${k === 'in' ? 'checked' : ''}><span>Deposit</span></label>
+      <label><input type="radio" name="kind" value="out" ${k === 'out' ? 'checked' : ''}><span>Withdraw</span></label></div>
+    <input class="amount" name="amount" inputmode="decimal" placeholder="€0" value="${s.amount != null ? Math.abs(s.amount) : ''}" required autofocus autocomplete="off">
+    <input name="note" placeholder="Note (e.g. November savings, Christmas bonus)" value="${esc(s.note || '')}" maxlength="120">
+    <input type="date" name="saved_on" value="${s.saved_on || todayStr()}" required>
+    ${whoToggle('saved_by', s.saved_by || uid())}
+    <button class="btn primary">Save</button>
+    ${s.id ? `<button type="button" class="btn danger" data-act="delSaving" data-id="${s.id}">Delete</button>` : ''}
+  </form>`;
+}
+
+/* ───────────── Actions (taps) ───────────── */
+async function refresh(msg) { await loadData(); render(); if (msg) toast(msg); }
+const PALETTE = ['#7a3e65', '#c28a2c', '#3f7d5a', '#c0573e', '#a07b3b', '#8e4a7a', '#b05a7a', '#5f7a6e', '#7d6e63'];
+
+const ACTIONS = {
+  add: () => openSheet(expenseForm()),
+  folder: d => { S.f[d.page] = d.id; render(); document.querySelector('.ftab.on')?.scrollIntoView({ block: 'nearest', inline: 'nearest' }); },
+  edit: d => { const e = S.exp.find(x => x.id === d.id); if (e) openSheet(expenseForm(e)); },
+  close: closeSheet,
+  prevMonth: async () => { S.month = addMonths(S.month, -1); await refresh(); },
+  nextMonth: async () => { const n = addMonths(S.month, 1); if (n <= monthKey(new Date())) { S.month = n; await refresh(); } },
+  delExpense: async d => {
+    if (!confirm('Delete this expense?')) return;
+    await q(sb.from('expenses').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
+  },
+  addSaving: d => openSheet(savingForm({}, d.kind)),
+  editSaving: d => { const s = S.sav.find(x => x.id === d.id); if (s) openSheet(savingForm(s)); },
+  delSaving: async d => {
+    if (!confirm('Delete this entry?')) return;
+    await q(sb.from('savings').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
+  },
+  delCat: async d => {
+    if (!confirm('Delete this category? Its expenses become "Uncategorised".')) return;
+    await q(sb.from('categories').delete().eq('id', d.id)); await refresh('Category deleted');
+  },
+  savMode: d => { S.savMode = d.mode; render(); },
+  nextIcon: (d, btn) => {
+    const input = btn.closest('form').querySelector('input[name=icon]');
+    const i = CAT_ICONS.indexOf(input.value);
+    input.value = CAT_ICONS[(i + 1) % CAT_ICONS.length];
+    btn.innerHTML = ic(input.value, 18);
+  },
+  useSuggest: d => { const i = document.querySelector('#calc input[name=monthly]'); if (i) { i.value = d.v; updateCalc(); } },
+  calcReset: () => { try { localStorage.removeItem('nest-calc-' + S.savMode); } catch {} if (S.calc) delete S.calc[S.savMode]; render(); },
+  copyCode: async () => {
+    try { await navigator.clipboard.writeText(S.household.invite_code); toast('Invite code copied'); }
+    catch { toast('Code: ' + S.household.invite_code); }
+  },
+  export: () => {
+    const rows = [['date', 'amount', 'category', 'note', 'paid_by']].concat(
+      S.exp.map(e => [e.spent_on, e.amount, catOf(e.category_id).name, e.note || '', memberName(e.paid_by)]));
+    const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' }));
+    a.download = `nest-expenses-${S.month}.csv`; a.click();
+  },
+  signout: async () => { if (S.channel) sb.removeChannel(S.channel); await sb.auth.signOut(); S.household = null; renderAuth(); }
+};
+
+/* ───────────── Forms (submits) ───────────── */
+const FORMS = {
+  auth: async (fd, _f, sub) => {
+    const email = fd.get('email').trim(), password = fd.get('password');
+    const msg = document.getElementById('authmsg');
+    if (sub?.value === 'up') {
+      const { data, error } = await sb.auth.signUp({ email, password, options: { emailRedirectTo: location.origin + location.pathname } });
+      if (error) return toast(error.message);
+      if (!data.session) msg.textContent = 'Check your email and tap the confirmation link, then sign in.';
+    } else {
+      const { error } = await sb.auth.signInWithPassword({ email, password });
+      if (error) return toast(error.message);
+    }
+  },
+  create: async fd => { await q(sb.rpc('create_household', { p_name: fd.get('hname'), p_display: fd.get('name') })); await boot(); },
+  join: async fd => { await q(sb.rpc('join_household', { p_code: fd.get('code'), p_display: fd.get('name') })); await boot(); },
+
+  expense: async fd => {
+    const amount = num(fd.get('amount'));
+    if (!(amount > 0)) return toast('Enter an amount');
+    const row = {
+      household_id: S.household.id, amount: Math.round(amount * 100) / 100,
+      category_id: fd.get('category_id') || null, note: fd.get('note').trim() || null,
+      spent_on: fd.get('spent_on'), paid_by: fd.get('paid_by')
+    };
+    const id = fd.get('id');
+    if (id) await q(sb.from('expenses').update(row).eq('id', id));
+    else await q(sb.from('expenses').insert(row));
+    S.lastCat = row.category_id;
+    closeSheet();
+    await refresh(id ? 'Saved' : `Added ${eur(row.amount)}`);
+  },
+  saving: async fd => {
+    const amount = num(fd.get('amount'));
+    if (!(amount > 0)) return toast('Enter an amount');
+    const row = {
+      household_id: S.household.id,
+      amount: Math.round(amount * 100) / 100 * (fd.get('kind') === 'out' ? -1 : 1),
+      note: fd.get('note').trim() || null, saved_on: fd.get('saved_on'), saved_by: fd.get('saved_by')
+    };
+    const id = fd.get('id');
+    if (id) await q(sb.from('savings').update(row).eq('id', id));
+    else await q(sb.from('savings').insert(row));
+    closeSheet();
+    S.calc = null;
+    await refresh(row.amount > 0 ? 'Saved' : 'Withdrawal logged');
+  },
+  profile: async fd => {
+    await q(sb.from('members').update({ display_name: fd.get('display_name').trim(), monthly_income: num(fd.get('monthly_income')) || 0, savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null })
+      .eq('household_id', S.household.id).eq('user_id', uid()));
+    S.calc = null;
+    await refresh('Saved');
+  },
+  household: async fd => {
+    await q(sb.from('households').update({
+      name: fd.get('name').trim(), savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null
+    }).eq('id', S.household.id));
+    await loadHousehold(); await refresh('Saved');
+  },
+  cat: async fd => {
+    const row = { name: fd.get('name').trim(), icon: fd.get('icon').trim() || 'box' };
+    let id = fd.get('id');
+    if (id) await q(sb.from('categories').update(row).eq('id', id));
+    else id = (await q(sb.from('categories').insert({ ...row, household_id: S.household.id, sort: S.cats.length + 1, color: PALETTE[S.cats.length % PALETTE.length] }).select().single())).id;
+    const budgets = S.members.map(m => ({ household_id: S.household.id, category_id: id, user_id: m.user_id, amount: num(fd.get('b_' + m.user_id)) || 0 }));
+    await q(sb.from('budgets').upsert(budgets, { onConflict: 'category_id,user_id' }));
+    await refresh(fd.get('id') ? 'Saved' : 'Category added');
+  }
+};
+
+/* ───────────── Event wiring ───────────── */
+document.addEventListener('click', e => {
+  const t = e.target.closest('[data-tab],[data-act]');
+  if (!t) return;
+  if (t.dataset.tab) { S.tab = t.dataset.tab; render(); window.scrollTo(0, 0); return; }
+  const fn = ACTIONS[t.dataset.act];
+  if (fn) { e.preventDefault(); Promise.resolve(fn(t.dataset, t)).catch(err => console.error(err)); }
+});
+document.addEventListener('submit', async e => {
+  const form = e.target, fn = FORMS[form.dataset.form];
+  if (!fn) return;
+  e.preventDefault();
+  const btn = e.submitter || form.querySelector('button:not([type=button])');
+  if (btn) btn.disabled = true;
+  try { await fn(new FormData(form), form, e.submitter); }
+  catch (err) { console.error(err); }
+  finally { if (btn && btn.isConnected) btn.disabled = false; }
+});
+document.addEventListener('input', e => { if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) updateBudgetLeft(); });
+
+if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
+init();
