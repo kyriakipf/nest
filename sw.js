@@ -1,5 +1,5 @@
 // Bump this version whenever you change any file, so phones pick up the update.
-const CACHE = 'nest-v1';
+const CACHE = 'nest-v2';
 const SHELL = [
   './', './index.html', './styles.css', './app.js', './config.js', './manifest.json',
   './icons/icon.svg', './icons/icon-192.png', './icons/icon-512.png'

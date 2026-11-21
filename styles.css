@@ -345,3 +345,13 @@ h2 { font-weight: 600; }
 :root { --brand: #b56d9c; }
 @media (prefers-color-scheme: light) { :root { --brand: #7a3e65; } }
 .switch:checked { background: var(--brand); }
+
+/* Savings: joint + all accounts side by side */
+.duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.duo .big { font-size: 24px; }
+.havenow { display: flex; justify-content: space-between; align-items: center; background: var(--card2); border-radius: 10px; padding: 10px 12px; }
+.havenow b { font-size: 17px; }
+
+/* More → Budgets: income / budgets / left stays visible while scrolling */
+.folders.titled .paygrid { position: sticky; top: calc(env(safe-area-inset-top) + 47px); z-index: 2;
+  background: var(--card); margin: -12px -12px 6px; padding: 12px 12px 8px; border-bottom: 1px solid var(--line); }
