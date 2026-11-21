@@ -146,17 +146,20 @@ const budgetOf = (catId, userId = uid()) => +(S.budgets.find(b => b.category_id 
 // Budgets can be marked as savings (e.g. "Savings", "Household savings"): they don't count as spending.
 // A savings budget is either "personal" (filled by your deposits to your own account, not the child one)
 // or "joint" (filled by the joint account's deposits). Neither can be picked when adding an expense.
-const savingKind = c => c?.saving_kind || (c?.is_saving ? 'personal' : null);
+// Budgets marked as savings before the personal/joint choice existed: guess from the name.
+const savingKind = c => c?.saving_kind || (c?.is_saving ? (/household|joint|κοιν|σπιτ/i.test(c.name || '') ? 'joint' : 'personal') : null);
 const isSavingCat = c => !!savingKind(c);
 function savedInto(c, key = S.month, userId = uid()) {
   const inMonth = S.sav.filter(s => s.saved_on.startsWith(key));
   return savingKind(c) === 'joint'
-    ? sum(inMonth.filter(isJoint))
+    ? sum(inMonth.filter(isJoint)) / Math.max(1, S.members.length)   // your half of the joint deposits
     : sum(inMonth.filter(s => s.account === 'personal' && s.saved_by === userId));
 }
 const spendOnly = list => list.filter(e => !isSavingCat(catOf(e.category_id)));
 const myBudgetTotal = (userId = uid()) => sum(S.cats.filter(c => !isSavingCat(c)), c => budgetOf(c.id, userId));
 const mySavingBudget = (userId = uid()) => sum(S.cats.filter(isSavingCat), c => budgetOf(c.id, userId));
+// Income for budgeting = salary + extras (e.g. a supermarket card). Bonuses only use the salary.
+const incomeOf = m => (+m?.monthly_income || 0) + (+m?.extra_income || 0);
 // By default only what *I* paid; pass all = true for both of us.
 const monthExp = (key = S.month, all = false) => S.exp.filter(e => e.spent_on.startsWith(key) && (all || e.paid_by === uid()));
 const isTyping = () => { const a = document.activeElement; return a && app.contains(a) && /INPUT|SELECT|TEXTAREA/.test(a.tagName); };
@@ -543,7 +546,12 @@ function calcValues() {
   if (!S.calc[mode]) {
     let saved = {};
     try { saved = JSON.parse(localStorage.getItem('nest-calc-' + mode) || '{}'); } catch {}
+    // Default "save per month": Just me = my personal-savings budget; Together = both our household-savings budgets
+    const kind = mode === 'me' ? 'personal' : 'joint';
+    const people = mode === 'me' ? S.members.filter(m => m.user_id === uid()) : S.members;
+    const fromBudgets = sum(people, m => sum(S.cats.filter(c => savingKind(c) === kind), c => budgetOf(c.id, m.user_id)));
     S.calc[mode] = { ...CALC_DEFAULTS[mode], target: v.goal || 100000, ...saved };
+    if (fromBudgets > 0) S.calc[mode].monthly = fromBudgets;
   }
   // Always the real amount (not editable); child savings only if switched on
   const childNow = sum(S.sav.filter(s => isChild(s) && (mode === 'together' || s.saved_by === uid())));
@@ -617,7 +625,7 @@ function lineChart(pts, target) {
 function suggestSaving() {
   const me = S.savMode === 'me';
   const people = me ? S.members.filter(m => m.user_id === uid()) : S.members;
-  const income = sum(people, m => m.monthly_income);
+  const income = sum(people, incomeOf);
   const budget = sum(people, m => myBudgetTotal(m.user_id));
   const nowKey = monthKey(new Date());
   const past = [1, 2, 3].map(i => addMonths(nowKey, -i)).map(k => sum(spendOnly(monthExp(k, !me))));
@@ -635,7 +643,7 @@ function updateCalc() {
   const p = calcValues();
   box.querySelectorAll('input').forEach(i => { p[i.name] = i.type === 'checkbox' ? i.checked : (num(i.value) || 0); });
   p.salary = calcSalary();
-  const { start, salary, ...keep } = p;
+  const { start, salary, monthly, ...keep } = p;   // "save per month" always starts from your budgets
   try { localStorage.setItem('nest-calc-' + S.savMode, JSON.stringify(keep)); } catch {}
 
   // Run until the goal is reached, then chart up to that point (a little past it)
@@ -685,7 +693,7 @@ function catRow(c) {
 function updateBudgetLeft() {
   if (!document.querySelector('.paygrid')) return;
   S.members.forEach(m => {
-    const pay = +m.monthly_income || 0;
+    const pay = incomeOf(m);
     let acc = 0, sav = 0;
     document.querySelectorAll('form.catedit').forEach(f => {
       if (!f.querySelector('input[name=id]').value) return;
@@ -707,6 +715,8 @@ function viewSettings() {
       <label class="f">Name</label><input name="display_name" value="${esc(me.display_name)}" required>
       <label class="f">Monthly income, after tax (€)</label>
       <input name="monthly_income" class="money" inputmode="decimal" autocomplete="off" value="${+me.monthly_income ? moneyIn(me.monthly_income) : ''}">
+      <label class="f">Extras per month (€) · e.g. supermarket card, not counted for bonuses</label>
+      <input name="extra_income" class="money" inputmode="decimal" autocomplete="off" value="${+me.extra_income ? moneyIn(me.extra_income) : ''}" placeholder="0">
       <label class="f">My own savings goal (€)</label>
       <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+me.savings_goal ? moneyIn(me.savings_goal) : ''}" placeholder="e.g. 60.000">
       <label class="f">My goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}">
@@ -730,6 +740,7 @@ function viewSettings() {
   const budgetsBody = () => `<div class="paygrid">${S.members.map(m => `<div class="paybox">
         <div class="t1">${esc(m.user_id === uid() ? 'You' : m.display_name)}</div>
         <div class="row between"><span>Income</span><span class="amt">${+m.monthly_income ? eur0(m.monthly_income) : '—'}</span></div>
+        ${+m.extra_income ? `<div class="row between"><span>Extras</span><span class="amt">${eur0(m.extra_income)}</span></div>` : ''}
         <div class="row between"><span>Spending</span><span class="amt" id="bud-${m.user_id}"></span></div>
         <div class="row between"><span>Savings</span><span class="amt" id="sav-${m.user_id}"></span></div>
         <div class="row between left"><span>Left</span><span class="amt" id="left-${m.user_id}"></span></div>
@@ -926,7 +937,7 @@ const FORMS = {
     await refresh(row.amount > 0 ? 'Saved' : 'Withdrawal logged');
   },
   profile: async fd => {
-    await q(sb.from('members').update({ display_name: fd.get('display_name').trim(), monthly_income: num(fd.get('monthly_income')) || 0, savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null, child_account: fd.get('child_account') === 'on' })
+    await q(sb.from('members').update({ display_name: fd.get('display_name').trim(), monthly_income: num(fd.get('monthly_income')) || 0, extra_income: num(fd.get('extra_income')) || 0, savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null, child_account: fd.get('child_account') === 'on' })
       .eq('household_id', S.household.id).eq('user_id', uid()));
     S.calc = null;
     await refresh('Saved');
