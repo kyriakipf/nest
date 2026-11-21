@@ -24,7 +24,15 @@ const fmt0 = new Intl.NumberFormat('el-GR', { style: 'currency', currency: 'EUR'
 const eur = n => { const v = Math.round((+n || 0) * 100) / 100; return (Number.isInteger(v) ? fmt0 : fmt2).format(v); };
 const eur0 = n => fmt0.format(Math.round(+n || 0));
 const kfmt = v => Math.abs(v) >= 10000 ? '€' + Math.round(v / 1000) + 'k' : Math.abs(v) >= 1000 ? '€' + (v / 1000).toFixed(1).replace('.0', '') + 'k' : '€' + Math.round(v);
-const num = v => parseFloat(String(v ?? '').replace(/\s/g, '').replace(',', '.'));
+// Reads amounts typed the Greek way ("2.400,50") or the English way ("2400.50").
+function num(v) {
+  let t = String(v ?? '').replace(/[\s€]/g, '');
+  if (t.includes(',')) t = t.replace(/\./g, '').replace(',', '.');        // 2.400,50 → 2400.50
+  else if ((t.match(/\./g) || []).length > 1 || /\.\d{3}$/.test(t)) t = t.replace(/\./g, ''); // 2.400 → 2400
+  return parseFloat(t);
+}
+// Shows an amount in an input box with a thousands dot: 2400 → "2.400" (cents only if there are any)
+const moneyIn = n => (n === '' || n == null || isNaN(+n)) ? '' : (+n).toLocaleString('el-GR', { minimumFractionDigits: 0, maximumFractionDigits: 2, useGrouping: true });
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const safeColor = c => /^#[0-9a-f]{3,8}$/i.test(c || '') || /^var\(--[a-z0-9-]+\)$/.test(c || '') ? c : 'var(--brand)';
 const sum = (arr, f = x => x.amount) => arr.reduce((a, x) => a + (+f(x) || 0), 0);
@@ -542,7 +550,7 @@ function calcValues() {
   S.calc[mode].start = Math.round(v.total - (S.calc[mode].includeChild ? 0 : childNow));
   return S.calc[mode];
 }
-const calcField = (k, label) => `<div><label class="f">${label}</label><input name="${k}" type="number" inputmode="decimal" step="any" value="${calcValues()[k]}"></div>`;
+const calcField = (k, label) => `<div><label class="f">${label}</label><input name="${k}" class="money" inputmode="decimal" autocomplete="off" value="${moneyIn(calcValues()[k])}"></div>`;
 
 // Monthly income of whoever the Savings screen is showing (you, or both of you).
 const calcSalary = () => sum(S.savMode === 'me' ? S.members.filter(m => m.user_id === uid()) : S.members, m => m.monthly_income);
@@ -668,7 +676,7 @@ function catRow(c) {
     </div>
     <div class="r2">
       ${S.members.map(m => `<label><small>${esc(m.user_id === uid() ? 'You' : m.display_name)}</small>
-        <input name="b_${m.user_id}" type="number" inputmode="decimal" step="any" value="${c.id ? (budgetOf(c.id, m.user_id) || '') : ''}" placeholder="€/mo"></label>`).join('')}
+        <input name="b_${m.user_id}" class="money" inputmode="decimal" autocomplete="off" value="${c.id ? moneyIn(budgetOf(c.id, m.user_id)) : ''}" placeholder="€/mo"></label>`).join('')}
       <button class="iconbtn" title="Save">${ic(c.id ? 'check' : 'plus', 16)}</button>
     </div>
   </form>`;
@@ -698,9 +706,9 @@ function viewSettings() {
   const youBody = () => `<form data-form="profile">
       <label class="f">Name</label><input name="display_name" value="${esc(me.display_name)}" required>
       <label class="f">Monthly income, after tax (€)</label>
-      <input name="monthly_income" type="number" inputmode="decimal" step="any" value="${+me.monthly_income || ''}">
+      <input name="monthly_income" class="money" inputmode="decimal" autocomplete="off" value="${+me.monthly_income ? moneyIn(me.monthly_income) : ''}">
       <label class="f">My own savings goal (€)</label>
-      <input name="savings_goal" type="number" inputmode="decimal" step="any" value="${+me.savings_goal || ''}" placeholder="e.g. 60000">
+      <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+me.savings_goal ? moneyIn(me.savings_goal) : ''}" placeholder="e.g. 60.000">
       <label class="f">My goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}">
       <label class="bonusrow" style="background:var(--card2);border-radius:10px;margin-top:10px"><span class="bi">${ic('heart', 18)}</span>
         <span class="grow">Child savings account<small>Money from my parents. Only I can add to it.</small></span>
@@ -712,7 +720,7 @@ function viewSettings() {
   const homeBody = () => `<form data-form="household">
       <label class="f">Name</label><input name="name" value="${esc(h.name)}" required>
       <label class="f">Savings goal together (€)</label>
-      <input name="savings_goal" type="number" inputmode="decimal" step="any" value="${+h.savings_goal || ''}" placeholder="e.g. 100000">
+      <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+h.savings_goal ? moneyIn(h.savings_goal) : ''}" placeholder="e.g. 100.000">
       <label class="f">Goal date together</label><input name="goal_date" type="date" value="${h.goal_date || ''}">
       <button class="btn primary">Save</button>
     </form>
@@ -782,7 +790,7 @@ function expenseForm(e = {}) {
   return `<form data-form="expense" class="stack">
     <div class="sheet-head"><h3>${e.id ? 'Edit expense' : 'New expense'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
     <input type="hidden" name="id" value="${e.id || ''}">
-    <input class="amount" name="amount" inputmode="decimal" placeholder="€0" value="${e.amount ?? ''}" required autofocus autocomplete="off">
+    <input class="amount money" name="amount" inputmode="decimal" placeholder="0 €" value="${e.amount != null ? moneyIn(e.amount) : ''}" required autofocus autocomplete="off">
     <div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
     <input name="note" placeholder="Note (e.g. souvlaki, Lidl)" value="${esc(e.note || '')}" maxlength="120">
     <input type="date" name="spent_on" value="${e.spent_on || todayStr()}" required>
@@ -802,7 +810,7 @@ function savingForm(s = {}, kind = 'in') {
     <div class="seg"><label><input type="radio" name="account" value="joint" ${acc === 'joint' ? 'checked' : ''}><span>${ic('users', 14)} Joint</span></label>
       <label><input type="radio" name="account" value="personal" ${acc === 'personal' ? 'checked' : ''}><span>${ic('user', 14)} Mine</span></label>
       ${hasChild() ? `<label><input type="radio" name="account" value="child" ${acc === 'child' ? 'checked' : ''}><span>${ic('heart', 14)} Child</span></label>` : ''}</div>
-    <input class="amount" name="amount" inputmode="decimal" placeholder="€0" value="${s.amount != null ? Math.abs(s.amount) : ''}" required autofocus autocomplete="off">
+    <input class="amount money" name="amount" inputmode="decimal" placeholder="0 €" value="${s.amount != null ? moneyIn(Math.abs(s.amount)) : ''}" required autofocus autocomplete="off">
     <input name="note" placeholder="Note (e.g. November savings, Christmas bonus)" value="${esc(s.note || '')}" maxlength="120">
     <input type="date" name="saved_on" value="${s.saved_on || todayStr()}" required>
     <button class="btn primary">Save</button>
@@ -850,7 +858,7 @@ const ACTIONS = {
     input.value = CAT_ICONS[(i + 1) % CAT_ICONS.length];
     btn.innerHTML = ic(input.value, 18);
   },
-  useSuggest: d => { const i = document.querySelector('#calc input[name=monthly]'); if (i) { i.value = d.v; updateCalc(); } },
+  useSuggest: d => { const i = document.querySelector('#calc input[name=monthly]'); if (i) { i.value = moneyIn(d.v); updateCalc(); } },
   calcReset: () => { try { localStorage.removeItem('nest-calc-' + S.savMode); } catch {} if (S.calc) delete S.calc[S.savMode]; render(); },
   copyCode: async () => {
     try { await navigator.clipboard.writeText(S.household.invite_code); toast('Invite code copied'); }
@@ -957,6 +965,10 @@ document.addEventListener('submit', async e => {
   try { await fn(new FormData(form), form, e.submitter); }
   catch (err) { console.error(err); }
   finally { if (btn && btn.isConnected) btn.disabled = false; }
+});
+document.addEventListener('focusout', e => {
+  const el = e.target;
+  if (el.classList?.contains('money') && el.value.trim() !== '' && !isNaN(num(el.value))) el.value = moneyIn(num(el.value));
 });
 document.addEventListener('input', e => { if (e.target.name === 'includeChild') { updateCalc(); render(); return; } if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) updateBudgetLeft(); });
 
