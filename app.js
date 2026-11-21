@@ -106,11 +106,40 @@ const S = {
   tab: 'home', month: monthKey(new Date()), channel: null, lastCat: null, f: {}, calc: null, savMode: 'together'
 };
 const uid = () => S.session?.user?.id;
+
+// Remember the screen, open tabs, savings mode, month and scroll position across refreshes.
+const UI_KEY = 'nest-ui';
+(function restoreUI() {
+  try {
+    const u = JSON.parse(localStorage.getItem(UI_KEY) || '{}');
+    if (['home', 'stats', 'savings', 'settings'].includes(u.tab)) S.tab = u.tab;
+    if (u.f && typeof u.f === 'object') S.f = u.f;
+    if (u.savMode === 'me' || u.savMode === 'together') S.savMode = u.savMode;
+    if (/^\d{4}-\d{2}$/.test(u.month || '') && u.month <= monthKey(new Date())) S.month = u.month;
+    S.restoreScroll = { y: +u.y || 0, inner: +u.inner || 0 };
+  } catch {}
+})();
+function saveUI() {
+  try {
+    localStorage.setItem(UI_KEY, JSON.stringify({ tab: S.tab, f: S.f, savMode: S.savMode, month: S.month,
+      y: window.scrollY, inner: document.querySelector('.view-home .fbody')?.scrollTop || 0 }));
+  } catch {}
+}
+let saveUITimer;
+const saveUISoon = () => { clearTimeout(saveUITimer); saveUITimer = setTimeout(saveUI, 250); };
+window.addEventListener('scroll', saveUISoon, { passive: true });
+document.addEventListener('scroll', e => { if (e.target.classList?.contains('fbody')) saveUISoon(); }, { capture: true, passive: true });
+window.addEventListener('pagehide', saveUI);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') saveUI(); });
 const memberName = id => S.members.find(m => m.user_id === id)?.display_name || '—';
 const catOf = id => S.cats.find(c => c.id === id) || { name: 'Uncategorised', icon: 'box', color: '#8b93a3' };
 // Each person has their own budget amount per category.
 const budgetOf = (catId, userId = uid()) => +(S.budgets.find(b => b.category_id === catId && b.user_id === userId)?.amount || 0);
-const myBudgetTotal = () => sum(S.cats, c => budgetOf(c.id));
+// Budgets can be marked as savings (e.g. "Savings", "Household savings"): they don't count as spending.
+const isSavingCat = c => !!c?.is_saving;
+const spendOnly = list => list.filter(e => !isSavingCat(catOf(e.category_id)));
+const myBudgetTotal = (userId = uid()) => sum(S.cats.filter(c => !isSavingCat(c)), c => budgetOf(c.id, userId));
+const mySavingBudget = (userId = uid()) => sum(S.cats.filter(isSavingCat), c => budgetOf(c.id, userId));
 // By default only what *I* paid; pass all = true for both of us.
 const monthExp = (key = S.month, all = false) => S.exp.filter(e => e.spent_on.startsWith(key) && (all || e.paid_by === uid()));
 const isTyping = () => { const a = document.activeElement; return a && app.contains(a) && /INPUT|SELECT|TEXTAREA/.test(a.tagName); };
@@ -142,6 +171,13 @@ async function boot() {
     await loadData();
     subscribe();
     render();
+    if (S.restoreScroll) {   // put you back where you were
+      const r = S.restoreScroll; S.restoreScroll = null;
+      requestAnimationFrame(() => {
+        window.scrollTo(0, r.y);
+        const fb = document.querySelector('.view-home .fbody'); if (fb) fb.scrollTop = r.inner;
+      });
+    }
   } catch (e) {
     app.innerHTML = `<div class="card center"><p>Couldn't load: ${esc(e.message)}</p>
       <p class="muted">Check your internet connection.</p><button class="btn primary" onclick="location.reload()">Try again</button></div>`;
@@ -235,6 +271,7 @@ function render() {
       : `<button class="tab ${S.tab === k ? 'on' : ''}" data-tab="${k}">${ic(i, 21)}<small>${l}</small></button>`).join('')}</nav>`;
   updateCalc();
   updateBudgetLeft();
+  saveUISoon();
 }
 
 function monthNav() {
@@ -279,8 +316,9 @@ function viewHome() {
   const daysLeft = isNow ? dim - day + 1 : 0;
   const pace = isNow ? day / dim : 1;
 
-  const ex = monthExp(), t = catTotals(ex);
-  const spent = sum(ex), budget = myBudgetTotal(), left = budget - spent;
+  const ex = monthExp(), t = catTotals(ex), spendEx = spendOnly(ex);
+  const spent = sum(spendEx), budget = myBudgetTotal(), left = budget - spent;
+  const savedPlan = mySavingBudget(), savedNow = sum(ex) - spent;
   const perDay = isNow ? Math.max(0, left) / daysLeft : null;
 
   const rows = S.cats.map(c => ({ c, spent: t[c.id] || 0, budget: budgetOf(c.id) })).filter(r => r.budget || r.spent);
@@ -288,19 +326,20 @@ function viewHome() {
   const ratio = r => r.budget ? r.spent / r.budget : (r.spent ? 9 : 0);
   rows.sort((a, b) => ratio(b) - ratio(a));
 
-  const over = rows.filter(r => r.budget && r.spent > r.budget);
-  const fast = isNow ? rows.filter(r => r.budget && r.spent < r.budget && r.spent / r.budget > 0.5 && r.spent / r.budget > pace + 0.2) : [];
+  const over = rows.filter(r => !isSavingCat(r.c) && r.budget && r.spent > r.budget);
+  const fast = isNow ? rows.filter(r => !isSavingCat(r.c) && r.budget && r.spent < r.budget && r.spent / r.budget > 0.5 && r.spent / r.budget > pace + 0.2) : [];
 
   const budgetsBody = () => rows.length ? rows.map(r => {
-      const isOver = r.budget ? r.spent > r.budget : r.spent > 0;
+      const sav = isSavingCat(r.c);
+      const isOver = !sav && (r.budget ? r.spent > r.budget : r.spent > 0);
       const isFast = fast.includes(r);
       const badge = isOver
         ? `<div class="badge bad">${ic('alert', 13)} ${r.budget ? `Over budget by ${eur0(r.spent - r.budget)}` : 'No budget set'}</div>`
         : isFast ? `<div class="badge warn">${ic('clock', 13)} Slow down: only ${eur0(r.budget - r.spent)} left for ${daysLeft} days</div>` : '';
       return `<div class="cat ${isOver ? 'hl bad' : isFast ? 'hl warn' : ''}">
-        <div class="row between"><span class="cname">${catIc(r.c)} ${esc(r.c.name)}</span>
+        <div class="row between"><span class="cname">${catIc(r.c)} ${esc(r.c.name)}${sav ? ' <span class="tag sav">Savings</span>' : ''}</span>
           <span class="amt">${eur0(r.spent)}<span class="muted"> / ${r.budget ? eur0(r.budget) : '—'}</span></span></div>
-        ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : 'var(--brand)')}${badge}</div>`;
+        ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : sav ? 'var(--ok)' : 'var(--brand)')}${badge}</div>`;
     }).join('')
     : '<div class="empty">You have no budgets yet. Set them in More → Budgets.</div>';
 
@@ -316,6 +355,7 @@ function viewHome() {
       <div class="stat"><b>${perDay != null ? eur0(perDay) : '—'}</b><span>Can spend / day</span></div>
       <div class="stat"><b>${isNow ? daysLeft : '—'}</b><span>${isNow ? (daysLeft === 1 ? 'Day left' : 'Days left') : 'Month ended'}</span></div>
     </div>
+    ${savedPlan ? `<p class="muted" style="margin:8px 0 0">Saved ${eur0(savedNow)} of ${eur0(savedPlan)} this month</p>` : ''}
   </div>
   ${folders('home', [
     { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', dot: over.length ? 'over' : fast.length ? 'warn' : '', body: budgetsBody },
@@ -340,7 +380,7 @@ function vbars(items, line) {
 }
 
 function viewStats() {
-  const ex = monthExp(), prevKey = addMonths(S.month, -1), prev = monthExp(prevKey);
+  const ex = spendOnly(monthExp()), prevKey = addMonths(S.month, -1), prev = spendOnly(monthExp(prevKey));
   const spent = sum(ex), prevSpent = sum(prev), budget = myBudgetTotal();
   const t = catTotals(ex), tp = catTotals(prev);
   const isNow = S.month === monthKey(new Date());
@@ -349,14 +389,14 @@ function viewStats() {
 
   const trendBody = () => {
     const months = [...Array(6)].map((_, i) => addMonths(S.month, i - 5));
-    const trend = months.map(k => ({ label: monthLabel(k, true), value: sum(monthExp(k)), hi: k === S.month }));
+    const trend = months.map(k => ({ label: monthLabel(k, true), value: sum(spendOnly(monthExp(k))), hi: k === S.month }));
     const withData = trend.filter(x => x.value);
     const avg = withData.length ? sum(withData, x => x.value) / withData.length : 0;
     return `${vbars(trend, budget)}<p class="muted">Average ${eur0(avg)} a month. The dashed line is your monthly budget (${eur0(budget)}).</p>`;
   };
 
   const compareBody = () => {
-    const changes = S.cats.map(c => ({ c, now: t[c.id] || 0, prev: tp[c.id] || 0 }))
+    const changes = S.cats.filter(c => !isSavingCat(c)).map(c => ({ c, now: t[c.id] || 0, prev: tp[c.id] || 0 }))
       .map(x => ({ ...x, d: x.now - x.prev })).filter(x => Math.abs(x.d) >= 1)
       .sort((a, b) => Math.abs(b.d) - Math.abs(a.d));
     return `<p class="muted" style="margin-top:0">${monthLabel(S.month, true)} compared with ${monthLabel(prevKey, true)}</p>` +
@@ -365,8 +405,8 @@ function viewStats() {
   };
 
   const whoBody = () => {
-    const all = monthExp(S.month, true), total = sum(all);
-    const people = S.members.map(m => ({ m, v: sum(all.filter(e => e.paid_by === m.user_id)), b: sum(S.cats, c => budgetOf(c.id, m.user_id)) }));
+    const all = spendOnly(monthExp(S.month, true)), total = sum(all);
+    const people = S.members.map(m => ({ m, v: sum(all.filter(e => e.paid_by === m.user_id)), b: myBudgetTotal(m.user_id) }));
     return `<p class="muted" style="margin-top:0">Together ${eur0(total)} this month</p>
       ${people.map(p => `<div class="cat"><div class="row between"><span>${esc(p.m.display_name)}</span>
         <span class="amt">${eur0(p.v)} <span class="muted">/ ${eur0(p.b)}</span></span></div>
@@ -392,19 +432,25 @@ function viewStats() {
 
 /* ───────────── Savings + calculator ───────────── */
 // The "Just me / Together" toggle changes the whole Savings screen, calculator included.
-// Two kinds of savings: the joint account (shared) and each person's own account.
+// Savings accounts: the joint account (shared), each person's own account, and an optional
+// child savings account (money from parents) that only its owner can add to.
 const isJoint = s => s.account === 'joint';
+const isChild = s => s.account === 'child';
 const canEditSaving = s => isJoint(s) || s.saved_by === uid();
+const meMember = () => S.members.find(m => m.user_id === uid()) || {};
+const hasChild = (userId = uid()) => !!S.members.find(m => m.user_id === userId)?.child_account;
+const accountName = s => isJoint(s) ? 'Joint account' : isChild(s) ? `${memberName(s.saved_by)} · child savings` : memberName(s.saved_by);
 
 function savingsView() {
   const me = S.savMode === 'me';
-  const mine = S.sav.filter(s => !isJoint(s) && s.saved_by === uid());
+  const mine = S.sav.filter(s => !isJoint(s) && s.saved_by === uid());   // my account + my child savings
   const joint = S.sav.filter(isJoint);
   const list = me ? mine : S.sav;                       // Together = all accounts
   const meRow = S.members.find(m => m.user_id === uid()) || {};
   const goal = me ? +meRow.savings_goal || 0 : +S.household.savings_goal || 0;
   const goalDate = me ? (meRow.goal_date || S.household.goal_date) : S.household.goal_date;
-  return { me, list, total: sum(list), jointTotal: sum(joint), goal, goalDate };
+  const myOwn = sum(mine.filter(s => !isChild(s))), myChild = sum(mine.filter(isChild));
+  return { me, list, total: sum(list), jointTotal: sum(joint), myOwn, myChild, goal, goalDate };
 }
 
 function viewSavings() {
@@ -414,8 +460,12 @@ function viewSavings() {
   const need = v.goal && ml > 0 ? Math.max(0, v.goal - v.total) / ml : null;
 
   const whoBody = () => {
-    const rows = [{ name: 'Joint account', v: v.jointTotal },
-      ...S.members.map(m => ({ name: m.user_id === uid() ? 'Your account' : `${m.display_name}'s account`, v: sum(S.sav.filter(s => !isJoint(s) && s.saved_by === m.user_id)) }))];
+    const rows = [{ name: 'Joint account', v: v.jointTotal }];
+    S.members.forEach(m => {
+      const own = m.user_id === uid();
+      rows.push({ name: own ? 'Your account' : `${m.display_name}'s account`, v: sum(S.sav.filter(s => s.account === 'personal' && s.saved_by === m.user_id)) });
+      if (hasChild(m.user_id)) rows.push({ name: own ? 'Your child savings' : `${m.display_name}'s child savings`, v: sum(S.sav.filter(s => isChild(s) && s.saved_by === m.user_id)) });
+    });
     return rows.map(r => `<div class="cat"><div class="row between"><span>${esc(r.name)}</span><span class="amt">${eur0(r.v)}</span></div>
       ${bar(v.total > 0 ? r.v / v.total : 0, null, 'var(--brand)')}</div>`).join('')
       + `<div class="row between cat"><b>All accounts</b><b class="amt">${eur0(v.total)}</b></div>`;
@@ -423,7 +473,7 @@ function viewSavings() {
   const historyBody = () => `<div class="list">${v.list.length ? v.list.slice(0, 60).map(s => `<div class="item" ${canEditSaving(s) ? `data-act="editSaving" data-id="${s.id}"` : ''}>
       <span class="cicon" style="--c:${s.amount > 0 ? 'var(--ok)' : 'var(--bad)'}">${ic(s.amount > 0 ? 'down' : 'up', 16)}</span>
       <div class="grow"><div class="ellipsis">${esc(s.note || (s.amount > 0 ? 'Deposit' : 'Withdrawal'))}</div>
-        <div class="muted">${fmtDate(s.saved_on)} · ${isJoint(s) ? 'Joint account' : esc(memberName(s.saved_by))}</div></div>
+        <div class="muted">${fmtDate(s.saved_on)} · ${esc(accountName(s))}</div></div>
       <div class="amt ${s.amount > 0 ? 'pos' : 'neg'}">${s.amount > 0 ? '+' : ''}${eur(s.amount)}</div></div>`).join('')
     : '<div class="empty">Log what you put aside each month, and your starting savings.</div>'}</div>`;
 
@@ -432,7 +482,11 @@ function viewSavings() {
   tabs.push({ id: 'history', label: `${ic('clock', 14)} History`, color: 'var(--brand)', body: historyBody });
 
   const amounts = v.me
-    ? `<div class="muted">Your account</div><div class="big">${eur(v.total)}</div>`
+    ? (hasChild()
+      ? `<div class="duo"><div><div class="muted">My account</div><div class="big">${eur0(v.myOwn)}</div></div>
+           <div><div class="muted">Child savings</div><div class="big">${eur0(v.myChild)}</div></div></div>
+         <p class="muted" style="margin:0 0 8px">Total: <b>${eur0(v.total)}</b></p>`
+      : `<div class="muted">Your account</div><div class="big">${eur(v.total)}</div>`)
     : `<div class="duo"><div><div class="muted">Joint account</div><div class="big">${eur0(v.jointTotal)}</div></div>
          <div><div class="muted">All our accounts</div><div class="big">${eur0(v.total)}</div></div></div>`;
 
@@ -460,8 +514,8 @@ function viewSavings() {
 
 // Separate calculator settings for "Just me" and "Together". "Saved now" always starts from the real savings.
 const CALC_DEFAULTS = {
-  me: { monthly: 1400, xmas: true, easter: true, summer: true },
-  together: { monthly: 2000, xmas: true, easter: true, summer: true }
+  me: { monthly: 1400, child: 0, xmas: true, easter: true, summer: true },
+  together: { monthly: 2000, child: 0, xmas: true, easter: true, summer: true }
 };
 function calcValues() {
   const mode = S.savMode, v = savingsView();
@@ -489,6 +543,7 @@ function calcBody() {
     <div class="havenow"><span class="muted">${S.savMode === 'me' ? 'You have now' : 'You have now, all accounts'}</span><b class="amt">${eur0(p.start)}</b></div>
     <div class="grid2">
       ${calcField('monthly', 'Save per month (€)')}${calcField('target', 'Goal (€)')}
+      ${(S.savMode === 'me' ? hasChild() : S.members.some(m => m.child_account)) ? calcField('child', 'Into child savings / month (€)') : ''}
     </div>
     <label class="f">Bonuses we'll save</label>
     <div class="bonuses">${row('xmas', ic('tree', 18), 'Christmas', 1)}${row('easter', ic('egg', 18), 'Easter', 0.5)}${row('summer', ic('sun', 18), 'Summer', 0.5)}</div>
@@ -506,8 +561,9 @@ function simulate(p, months) {
     const d = new Date(now.getFullYear(), now.getMonth() + i, 1), mo = d.getMonth();
     const sal = p.salary || 0;
     const bonus = (mo === 11 && p.xmas ? sal : 0) + (mo === 3 && p.easter ? sal / 2 : 0) + (mo === 5 && p.summer ? sal / 2 : 0);
-    added += p.monthly + bonus;
-    bal += p.monthly + bonus;
+    const childIn = (S.savMode === 'me' ? hasChild() : S.members.some(m => m.child_account)) ? (+p.child || 0) : 0;
+    added += p.monthly + childIn + bonus;
+    bal += p.monthly + childIn + bonus;
     pts.push({ bal, d });
     if (hit == null && p.target > 0 && bal >= p.target) hit = i;
   }
@@ -536,9 +592,9 @@ function suggestSaving() {
   const me = S.savMode === 'me';
   const people = me ? S.members.filter(m => m.user_id === uid()) : S.members;
   const income = sum(people, m => m.monthly_income);
-  const budget = sum(people, m => sum(S.cats, c => budgetOf(c.id, m.user_id)));
+  const budget = sum(people, m => myBudgetTotal(m.user_id));
   const nowKey = monthKey(new Date());
-  const past = [1, 2, 3].map(i => addMonths(nowKey, -i)).map(k => sum(monthExp(k, !me)));
+  const past = [1, 2, 3].map(i => addMonths(nowKey, -i)).map(k => sum(spendOnly(monthExp(k, !me))));
   const withData = past.filter(v => v > 0);
   const actual = withData.length ? sum(withData, v => v) / withData.length : 0;
   const spend = Math.max(budget, actual);
@@ -588,6 +644,8 @@ function catRow(c) {
       <input type="hidden" name="icon" value="${esc(c.icon || 'box')}">
       <button type="button" class="iconbtn pick" data-act="nextIcon" title="Change icon" style="--c:${safeColor(c.color || '#8b93a3')}">${catIc({ icon: c.icon || 'box' }, 18)}</button>
       <input name="name" value="${esc(c.name || '')}" placeholder="${c.id ? '' : 'New category'}" required aria-label="Name">
+      <input type="hidden" name="is_saving" value="${c.is_saving ? '1' : ''}">
+      <button type="button" class="iconbtn savmark ${c.is_saving ? 'on' : ''}" data-act="toggleSavCat" title="Mark as savings">${ic('wallet', 15)}</button>
       ${c.id ? `<button type="button" class="iconbtn" data-act="delCat" data-id="${c.id}" title="Delete">${ic('trash', 16)}</button>` : '<span></span>'}
     </div>
     <div class="r2">
@@ -602,12 +660,15 @@ function updateBudgetLeft() {
   if (!document.querySelector('.paygrid')) return;
   S.members.forEach(m => {
     const pay = +m.monthly_income || 0;
-    let acc = 0;
+    let acc = 0, sav = 0;
     document.querySelectorAll('form.catedit').forEach(f => {
       if (!f.querySelector('input[name=id]').value) return;
-      acc += num(f.querySelector(`input[name="b_${m.user_id}"]`)?.value) || 0;
+      const v = num(f.querySelector(`input[name="b_${m.user_id}"]`)?.value) || 0;
+      if (f.querySelector('input[name=is_saving]').value) sav += v; else acc += v;
     });
     document.getElementById('bud-' + m.user_id).textContent = eur0(acc);
+    document.getElementById('sav-' + m.user_id).textContent = eur0(sav);
+    acc += sav;
     const l = document.getElementById('left-' + m.user_id);
     l.textContent = pay ? eur0(pay - acc) : 'Add income';
     l.classList.toggle('neg', pay - acc < 0);
@@ -623,6 +684,9 @@ function viewSettings() {
       <label class="f">My own savings goal (€)</label>
       <input name="savings_goal" type="number" inputmode="decimal" step="any" value="${+me.savings_goal || ''}" placeholder="e.g. 60000">
       <label class="f">My goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}">
+      <label class="bonusrow" style="background:var(--card2);border-radius:10px;margin-top:10px"><span class="bi">${ic('heart', 18)}</span>
+        <span class="grow">Child savings account<small>Money from my parents. Only I can add to it.</small></span>
+        <input type="checkbox" class="switch" name="child_account" ${me.child_account ? 'checked' : ''}></label>
       <button class="btn primary">Save</button>
     </form>
     <p class="muted">Signed in as ${esc(S.session.user.email)}</p>
@@ -640,7 +704,8 @@ function viewSettings() {
   const budgetsBody = () => `<div class="paygrid">${S.members.map(m => `<div class="paybox">
         <div class="t1">${esc(m.user_id === uid() ? 'You' : m.display_name)}</div>
         <div class="row between"><span>Income</span><span class="amt">${+m.monthly_income ? eur0(m.monthly_income) : '—'}</span></div>
-        <div class="row between"><span>Budgets</span><span class="amt" id="bud-${m.user_id}"></span></div>
+        <div class="row between"><span>Spending</span><span class="amt" id="bud-${m.user_id}"></span></div>
+        <div class="row between"><span>Savings</span><span class="amt" id="sav-${m.user_id}"></span></div>
         <div class="row between left"><span>Left</span><span class="amt" id="left-${m.user_id}"></span></div>
       </div>`).join('')}</div>
     ${S.cats.map(catRow).join('')}${catRow({})}
@@ -667,6 +732,15 @@ function unlockPage() {
   document.body.style.top = '';
   window.scrollTo(0, lockPage.y || 0);
 }
+
+// Keep the form inside the part of the screen the keyboard doesn't cover.
+function fitToKeyboard() {
+  const h = window.visualViewport ? window.visualViewport.height : window.innerHeight;
+  document.documentElement.style.setProperty('--vvh', h + 'px');
+}
+if (window.visualViewport) window.visualViewport.addEventListener('resize', fitToKeyboard);
+window.addEventListener('resize', fitToKeyboard);
+fitToKeyboard();
 
 function openSheet(html) {
   lockPage();
@@ -700,14 +774,15 @@ function expenseForm(e = {}) {
 }
 function savingForm(s = {}, kind = 'in') {
   const k = s.amount != null ? (s.amount < 0 ? 'out' : 'in') : kind;
-  const acc = s.id ? (isJoint(s) ? 'joint' : 'personal') : (S.savMode === 'me' ? 'personal' : 'joint');
+  const acc = s.id ? (s.account || 'personal') : (S.savMode === 'me' ? 'personal' : 'joint');
   return `<form data-form="saving" class="stack">
     <div class="sheet-head"><h3>${s.id ? 'Edit' : k === 'in' ? 'Add to savings' : 'Take from savings'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
     <input type="hidden" name="id" value="${s.id || ''}">
     <div class="seg"><label><input type="radio" name="kind" value="in" ${k === 'in' ? 'checked' : ''}><span>Deposit</span></label>
       <label><input type="radio" name="kind" value="out" ${k === 'out' ? 'checked' : ''}><span>Withdraw</span></label></div>
-    <div class="seg"><label><input type="radio" name="account" value="joint" ${acc === 'joint' ? 'checked' : ''}><span>${ic('users', 14)} Joint account</span></label>
-      <label><input type="radio" name="account" value="personal" ${acc === 'personal' ? 'checked' : ''}><span>${ic('user', 14)} My account</span></label></div>
+    <div class="seg"><label><input type="radio" name="account" value="joint" ${acc === 'joint' ? 'checked' : ''}><span>${ic('users', 14)} Joint</span></label>
+      <label><input type="radio" name="account" value="personal" ${acc === 'personal' ? 'checked' : ''}><span>${ic('user', 14)} Mine</span></label>
+      ${hasChild() ? `<label><input type="radio" name="account" value="child" ${acc === 'child' ? 'checked' : ''}><span>${ic('heart', 14)} Child</span></label>` : ''}</div>
     <input class="amount" name="amount" inputmode="decimal" placeholder="€0" value="${s.amount != null ? Math.abs(s.amount) : ''}" required autofocus autocomplete="off">
     <input name="note" placeholder="Note (e.g. November savings, Christmas bonus)" value="${esc(s.note || '')}" maxlength="120">
     <input type="date" name="saved_on" value="${s.saved_on || todayStr()}" required>
@@ -742,6 +817,12 @@ const ACTIONS = {
     await q(sb.from('categories').delete().eq('id', d.id)); await refresh('Category deleted');
   },
   savMode: d => { S.savMode = d.mode; render(); },
+  toggleSavCat: (d, btn) => {
+    const input = btn.closest('form').querySelector('input[name=is_saving]');
+    input.value = input.value ? '' : '1';
+    btn.classList.toggle('on', !!input.value);
+    updateBudgetLeft();
+  },
   nextIcon: (d, btn) => {
     const input = btn.closest('form').querySelector('input[name=icon]');
     const i = CAT_ICONS.indexOf(input.value);
@@ -804,11 +885,11 @@ const FORMS = {
       household_id: S.household.id,
       amount: Math.round(amount * 100) / 100 * (fd.get('kind') === 'out' ? -1 : 1),
       note: fd.get('note').trim() || null, saved_on: fd.get('saved_on'),
-      account: fd.get('account') === 'joint' ? 'joint' : 'personal'
+      account: ['joint', 'child'].includes(fd.get('account')) && (fd.get('account') !== 'child' || hasChild()) ? fd.get('account') : 'personal'
     };
     const id = fd.get('id');
     // Personal deposits always belong to whoever is signed in; joint ones don't need a name.
-    if (row.account === 'personal' || !id) row.saved_by = uid();
+    if (row.account !== 'joint' || !id) row.saved_by = uid();
     if (id) await q(sb.from('savings').update(row).eq('id', id));
     else await q(sb.from('savings').insert(row));
     closeSheet();
@@ -816,7 +897,7 @@ const FORMS = {
     await refresh(row.amount > 0 ? 'Saved' : 'Withdrawal logged');
   },
   profile: async fd => {
-    await q(sb.from('members').update({ display_name: fd.get('display_name').trim(), monthly_income: num(fd.get('monthly_income')) || 0, savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null })
+    await q(sb.from('members').update({ display_name: fd.get('display_name').trim(), monthly_income: num(fd.get('monthly_income')) || 0, savings_goal: num(fd.get('savings_goal')) || 0, goal_date: fd.get('goal_date') || null, child_account: fd.get('child_account') === 'on' })
       .eq('household_id', S.household.id).eq('user_id', uid()));
     S.calc = null;
     await refresh('Saved');
@@ -828,7 +909,7 @@ const FORMS = {
     await loadHousehold(); await refresh('Saved');
   },
   cat: async fd => {
-    const row = { name: fd.get('name').trim(), icon: fd.get('icon').trim() || 'box' };
+    const row = { name: fd.get('name').trim(), icon: fd.get('icon').trim() || 'box', is_saving: !!fd.get('is_saving') };
     let id = fd.get('id');
     if (id) await q(sb.from('categories').update(row).eq('id', id));
     else id = (await q(sb.from('categories').insert({ ...row, household_id: S.household.id, sort: S.cats.length + 1, color: PALETTE[S.cats.length % PALETTE.length] }).select().single())).id;

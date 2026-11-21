@@ -355,3 +355,16 @@ h2 { font-weight: 600; }
 /* More → Budgets: income / budgets / left stays visible while scrolling */
 .folders.titled .paygrid { position: sticky; top: calc(env(safe-area-inset-top) + 47px); z-index: 2;
   background: var(--card); margin: -12px -12px 6px; padding: 12px 12px 8px; border-bottom: 1px solid var(--line); }
+
+/* Savings marker on budgets */
+.catedit .r1 { grid-template-columns: 44px 1fr 34px 34px; }
+.iconbtn.savmark { color: var(--muted); opacity: .55; }
+.iconbtn.savmark.on { color: var(--ok); opacity: 1; background: color-mix(in srgb, var(--ok) 14%, var(--card2)); border-color: color-mix(in srgb, var(--ok) 40%, transparent); }
+.tag.sav { color: var(--ok); background: color-mix(in srgb, var(--ok) 13%, transparent); }
+
+/* Forms open at the top of the screen, so the phone keyboard never covers them */
+.panel { top: calc(env(safe-area-inset-top) + 8px); bottom: auto; left: 8px; right: 8px;
+  border-radius: 18px; transform: translateY(calc(-100% - 40px));
+  max-height: calc(var(--vvh, 100dvh) - env(safe-area-inset-top) - 16px);
+  padding-bottom: 14px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+.sheet.open .panel { transform: none; }
