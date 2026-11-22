@@ -110,7 +110,7 @@ const catBadge = c => `<span class="cicon" style="--c:${safeColor(c.color)}">${c
 
 /* ───────────── State ───────────── */
 const S = {
-  session: null, household: null, members: [], cats: [], budgets: [], exp: [], sav: [],
+  session: null, household: null, members: [], cats: [], budgets: [], exp: [], sav: [], recurring: [],
   tab: 'home', month: monthKey(new Date()), channel: null, lastCat: null, f: {}, calc: null, savMode: 'together'
 };
 const uid = () => S.session?.user?.id;
@@ -123,13 +123,14 @@ const UI_KEY = 'nest-ui';
     if (['home', 'stats', 'savings', 'settings'].includes(u.tab)) S.tab = u.tab;
     if (u.f && typeof u.f === 'object') S.f = u.f;
     if (u.savMode === 'me' || u.savMode === 'together') S.savMode = u.savMode;
+    if ([0, 1, 2].includes(u.bPage)) S.bPage = u.bPage;
     if (/^\d{4}-\d{2}$/.test(u.month || '') && u.month <= monthKey(new Date())) S.month = u.month;
     S.restoreScroll = { y: +u.y || 0, inner: +u.inner || 0 };
   } catch {}
 })();
 function saveUI() {
   try {
-    localStorage.setItem(UI_KEY, JSON.stringify({ tab: S.tab, f: S.f, savMode: S.savMode, month: S.month,
+    localStorage.setItem(UI_KEY, JSON.stringify({ tab: S.tab, f: S.f, savMode: S.savMode, month: S.month, bPage: S.bPage || 0,
       y: window.scrollY, inner: document.querySelector('.view-home .fbody')?.scrollTop || 0 }));
   } catch {}
 }
@@ -156,7 +157,9 @@ function savedInto(c, key = S.month, userId = uid()) {
     : sum(inMonth.filter(s => s.account === 'personal' && s.saved_by === userId));
 }
 const spendOnly = list => list.filter(e => !isSavingCat(catOf(e.category_id)));
-const myBudgetTotal = (userId = uid()) => sum(S.cats.filter(c => !isSavingCat(c)), c => budgetOf(c.id, userId));
+const catBudgetTotal = (userId = uid()) => sum(S.cats.filter(c => !isSavingCat(c)), c => budgetOf(c.id, userId));
+// Spending budget = your category budgets + your share of recurring bills
+const myBudgetTotal = (userId = uid()) => catBudgetTotal(userId) + recurringMonthly(userId);
 const mySavingBudget = (userId = uid()) => sum(S.cats.filter(isSavingCat), c => budgetOf(c.id, userId));
 // Income for budgeting = salary + extras (e.g. a supermarket card). Bonuses only use the salary.
 const incomeOf = m => (+m?.monthly_income || 0) + (+m?.extra_income || 0);
@@ -189,6 +192,7 @@ async function boot() {
     await loadHousehold();
     if (!S.household) return renderJoin();
     await loadData();
+    if (await processRecurring().catch(() => 0)) await loadData();   // add fixed bills that came due
     subscribe();
     render();
     if (S.restoreScroll) {   // put you back where you were
@@ -216,22 +220,23 @@ async function loadHousehold() {
 async function loadData() {
   const hid = S.household.id;
   const from = addMonths(S.month, -5) + '-01', to = addMonths(S.month, 1) + '-01';
-  const [cats, budgets, exp, sav, members] = await Promise.all([
+  const [cats, budgets, exp, sav, members, recurring] = await Promise.all([
     q(sb.from('categories').select('*').eq('household_id', hid).order('sort').order('name')),
     q(sb.from('budgets').select('*').eq('household_id', hid)),
     q(sb.from('expenses').select('*').eq('household_id', hid).gte('spent_on', from).lt('spent_on', to)
       .order('spent_on', { ascending: false }).order('created_at', { ascending: false })),
     q(sb.from('savings').select('*').eq('household_id', hid).order('saved_on', { ascending: false }).order('created_at', { ascending: false })),
-    q(sb.from('members').select('*').eq('household_id', hid).order('joined_at'))
+    q(sb.from('members').select('*').eq('household_id', hid).order('joined_at')),
+    q(sb.from('recurring').select('*').eq('household_id', hid).order('next_due'))
   ]);
-  Object.assign(S, { cats, budgets, exp, sav, members });
+  Object.assign(S, { cats, budgets, exp, sav, members, recurring });
 }
 
 let reloadTimer;
 function scheduleReload() {
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(async () => {
-    try { await loadData(); if (!isTyping() && !S.budgetsDirty) render(); } catch {}
+    try { await loadData(); if (await processRecurring().catch(() => 0)) await loadData(); if (!isTyping() && !S.budgetsDirty) render(); } catch {}
   }, 500);
 }
 function subscribe() {
@@ -241,6 +246,7 @@ function subscribe() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'savings' }, scheduleReload)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, scheduleReload)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'budgets' }, scheduleReload)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'recurring' }, scheduleReload)
     .subscribe();
 }
 document.addEventListener('visibilitychange', () => {
@@ -287,16 +293,196 @@ function renderJoin() {
   </div>`;
 }
 
+/* ───────────── Recurring bills ───────────── */
+// A recurring bill repeats every month (on a day of the month) or every N days.
+// Fixed-price bills are added automatically when they're due; bills that vary (like κοινόχρηστα)
+// wait for you to tap "Pay" and enter the real amount.
+// split = { user_id: share between 0 and 1 } says who pays how much of each bill.
+const ymd = d => monthKey(d) + '-' + String(d.getDate()).padStart(2, '0');
+const daysBetween = (a, b) => Math.round((new Date(b + 'T00:00') - new Date(a + 'T00:00')) / 864e5);
+const isFixed = r => r.amount != null && +r.amount > 0;
+const newId = () => (window.crypto?.randomUUID ? crypto.randomUUID()
+  : 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => { const r = Math.random() * 16 | 0; return (c === 'x' ? r : (r & 3 | 8)).toString(16); }));
+
+function nextDue(r, fromStr) {
+  const d = new Date(fromStr + 'T00:00');
+  if (r.repeat === 'days') { d.setDate(d.getDate() + Math.max(1, +r.every_days || 30)); return ymd(d); }
+  const day = +r.day_of_month || d.getDate();
+  const y = d.getFullYear(), m = d.getMonth() + 1;          // next month
+  const dim = new Date(y, m + 1, 0).getDate();
+  return ymd(new Date(y, m, Math.min(day, dim)));
+}
+
+// Turn a split into euro amounts per person (rounded so the parts add up exactly).
+function splitShares(split, amount) {
+  const ids = S.members.map(m => m.user_id);
+  let fr = ids.map(id => +(split?.[id] ?? 0));
+  const tot = fr.reduce((a, b) => a + b, 0);
+  fr = tot > 0 ? fr.map(f => f / tot) : ids.map(() => 1 / ids.length);
+  let left = Math.round(amount * 100);
+  return ids.map((id, i) => {
+    const cents = i === ids.length - 1 ? left : Math.round(amount * 100 * fr[i]);
+    left -= cents;
+    return { user_id: id, amount: cents / 100 };
+  }).filter(s => s.amount > 0);
+}
+const fractionOf = (r, userId) => (splitShares(r.split, 100).find(s => s.user_id === userId)?.amount || 0) / 100;
+const myFraction = r => fractionOf(r, uid());
+// What a bill costs per month on average (a bill every 45 days ≈ 0,68 times a month; one that varies = middle of its range)
+const monthlyOf = r => (isFixed(r) ? +r.amount : ((+r.min_amount || 0) + (+r.max_amount || 0)) / 2)
+  * (r.repeat === 'days' ? 30.44 / Math.max(1, +r.every_days || 30) : 1);
+// Each person's monthly share of all recurring bills: counted as its own line in the budget
+const recurringMonthly = (userId = uid()) => sum(S.recurring, r => monthlyOf(r) * fractionOf(r, userId));
+
+// One expense per person; split halves share a split_id so they can be deleted together.
+async function addSplitExpenses({ amount, category_id, note, spent_on, shares, recurring_id = null }) {
+  const split_id = shares.length > 1 ? newId() : null;
+  const rows = shares.map(s => ({ household_id: S.household.id, amount: s.amount, category_id, note, spent_on, paid_by: s.user_id, split_id, recurring_id }));
+  if (rows.length) await q(sb.from('expenses').insert(rows));
+}
+
+// Add any fixed bills that have come due. Safe if both phones do it at once:
+// a bill is only added by whoever moves its date forward first.
+async function processRecurring() {
+  const today = todayStr();
+  let added = 0;
+  for (const r of S.recurring.filter(isFixed)) {
+    let due = r.next_due, guard = 0;
+    while (due <= today && guard++ < 12) {
+      const nxt = nextDue(r, due);
+      const claimed = await q(sb.from('recurring').update({ next_due: nxt }).eq('id', r.id).eq('next_due', due).select());
+      if (!claimed?.length) break;
+      await addSplitExpenses({ amount: +r.amount, category_id: r.category_id, note: r.name, spent_on: due, shares: splitShares(r.split, +r.amount), recurring_id: r.id });
+      r.next_due = due = nxt;
+      added++;
+    }
+  }
+  return added;
+}
+
+function recItem(r) {
+  const c = catOf(r.category_id);
+  const freq = r.repeat === 'days' ? `Every ${r.every_days} days` : 'Monthly';
+  const mine = myFraction(r);
+  const thisMonth = S.exp.filter(e => e.recurring_id === r.id && e.spent_on.startsWith(monthKey(new Date())));
+  const addedTotal = sum(thisMonth), addedMine = sum(thisMonth.filter(e => e.paid_by === uid()));
+  let right;
+  if (!isFixed(r) && !thisMonth.length) {
+    right = `<button class="btn small primary" data-act="payRecurring" data-id="${r.id}">Add</button>`;
+  } else if (!isFixed(r)) {
+    right = `<div class="amt">${eur(addedMine)}</div>${mine < 0.999 ? `<div class="muted">of ${eur(addedTotal)}</div>` : ''}`;
+  } else if (mine < 0.001) {
+    right = `<div class="muted">${esc(memberName(splitShares(r.split, 100)[0]?.user_id))} pays</div><div class="muted">${eur(r.amount)}</div>`;
+  } else {
+    right = `<div class="amt">${eur(+r.amount * mine)}</div>${mine < 0.999 ? `<div class="muted">of ${eur(r.amount)}</div>` : ''}`;
+  }
+  const sub = !isFixed(r) ? `${freq} · ${thisMonth.length ? 'added this month' : `usually ${eur0(r.min_amount || 0)}–${eur0(r.max_amount || 0)}`}` : freq;
+  return `<div class="item" data-act="editRecurring" data-id="${r.id}">${catBadge(c)}
+    <div class="grow"><div class="ellipsis">${esc(r.name)}</div><div class="muted">${sub}</div></div>
+    <div class="recamt">${right}</div></div>`;
+}
+
+function recurringBody() {
+  const today = todayStr();
+  const list = [...S.recurring].sort((a, b) => monthlyOf(b) - monthlyOf(a));
+  return `<div class="list">${list.length ? list.map(r => recItem(r)).join('') : '<div class="empty">No recurring bills yet. Add rent, internet, TV…</div>'}</div>
+    <button class="btn" data-act="addRecurring">${ic('plus', 16)} Add recurring bill</button>`;
+}
+const recurringDue = () => false;   // no reminders: recurring bills are just tracked
+
+function recurringForm(r = {}) {
+  const cats = S.cats.filter(c => !isSavingCat(c));
+  const fixed = r.id ? isFixed(r) : true, rep = r.repeat || 'monthly';
+  const sel = r.category_id || cats[0]?.id;
+  const fr = S.members.map(m => r.id ? (splitShares(r.split, 1).find(s => s.user_id === m.user_id)?.amount || 0) : 1 / S.members.length);
+  const spVal = i => fixed ? (r.id ? moneyIn(Math.round(fr[i] * r.amount * 100) / 100) : '') : String(Math.round(fr[i] * 100));
+  return `<form data-form="recurring" class="stack ${fixed ? 'is-fixed' : 'is-varies'} rep-${rep}">
+    <div class="sheet-head"><h3>${r.id ? 'Edit recurring bill' : 'New recurring bill'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <input type="hidden" name="id" value="${r.id || ''}">
+    <input name="name" placeholder="Name (e.g. Rent, Internet, Cat vitamins)" value="${esc(r.name || '')}" required maxlength="60" ${r.id ? '' : 'autofocus'}>
+    <div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
+    <div class="seg"><label><input type="radio" name="kind" value="fixed" ${fixed ? 'checked' : ''}><span>Fixed price</span></label>
+      <label><input type="radio" name="kind" value="varies" ${fixed ? '' : 'checked'}><span>Varies</span></label></div>
+    <div class="only-fixed"><input name="amount" class="money" inputmode="decimal" autocomplete="off" placeholder="Amount (€)" value="${isFixed(r) ? moneyIn(r.amount) : ''}"></div>
+    <div class="only-varies grid2"><input name="min_amount" class="money" inputmode="decimal" autocomplete="off" placeholder="From (€)" value="${r.min_amount != null ? moneyIn(r.min_amount) : ''}">
+      <input name="max_amount" class="money" inputmode="decimal" autocomplete="off" placeholder="To (€)" value="${r.max_amount != null ? moneyIn(r.max_amount) : ''}"></div>
+    <div class="seg"><label><input type="radio" name="repeat" value="monthly" ${rep === 'monthly' ? 'checked' : ''}><span>Every month</span></label>
+      <label><input type="radio" name="repeat" value="days" ${rep === 'days' ? 'checked' : ''}><span>Every X days</span></label></div>
+    <div class="only-days"><input name="every_days" inputmode="numeric" placeholder="Every how many days? (e.g. 45)" value="${r.every_days || ''}"></div>
+    ${S.members.length > 1 ? `<label class="f">Who pays <span class="only-fixed">(€)</span><span class="only-varies">(%)</span></label>
+    <div class="grid2">${S.members.map((m, i) => `<label class="spl"><small>${esc(m.user_id === uid() ? 'You' : m.display_name)}</small>
+      <input name="sp_${m.user_id}" data-i="${i}" class="splitin" inputmode="decimal" autocomplete="off" value="${spVal(i)}"></label>`).join('')}</div>
+    <div class="row" style="flex-wrap:wrap;gap:6px">
+      <button type="button" class="btn small" data-act="recSplit" data-who="half">50/50</button>
+      ${S.members.map(m => `<button type="button" class="btn small" data-act="recSplit" data-who="${m.user_id}">All ${esc(m.user_id === uid() ? 'me' : m.display_name)}</button>`).join('')}
+    </div>` : ''}
+    <button class="btn primary">${r.id ? 'Save' : 'Add recurring bill'}</button>
+    ${r.id ? `<button type="button" class="btn danger" data-act="delRecurring" data-id="${r.id}">Delete</button>` : ''}
+  </form>`;
+}
+
+// Keep the recurring form's fields in step: fixed ↔ varies, monthly ↔ days, and the split adding up.
+function recFormFractions(form) {
+  const fixed = form.classList.contains('is-fixed');
+  const ins = [...form.querySelectorAll('.splitin')];
+  const vals = ins.map(i => num(i.value) || 0), tot = vals.reduce((a, b) => a + b, 0);
+  return tot > 0 ? vals.map(v => v / tot) : ins.map(() => 1 / ins.length);
+}
+function setRecSplit(form, fr) {
+  const fixed = form.classList.contains('is-fixed'), amount = num(form.querySelector('[name=amount]').value) || 0;
+  form.querySelectorAll('.splitin').forEach((inp, i) => {
+    inp.value = fixed ? (amount ? moneyIn(Math.round(fr[i] * amount * 100) / 100) : '') : String(Math.round(fr[i] * 100));
+  });
+}
+function syncRecurringForm(form, changed) {
+  if (changed?.name === 'kind') {
+    const fr = form._fr || recFormFractions(form);
+    form._fr = fr;
+    form.classList.toggle('is-fixed', changed.value === 'fixed');
+    form.classList.toggle('is-varies', changed.value === 'varies');
+    setRecSplit(form, fr);
+  }
+  if (changed?.name === 'repeat') {
+    form.classList.toggle('rep-monthly', changed.value === 'monthly');
+    form.classList.toggle('rep-days', changed.value === 'days');
+  }
+  if (changed?.name === 'amount' && form.classList.contains('is-fixed')) setRecSplit(form, form._fr || recFormFractions(form));
+  if (changed?.classList?.contains('splitin')) {
+    const ins = [...form.querySelectorAll('.splitin')];
+    if (ins.length === 2) {   // typing one person's part fills in the other
+      const fixed = form.classList.contains('is-fixed');
+      const whole = fixed ? (num(form.querySelector('[name=amount]').value) || 0) : 100;
+      const other = ins[1 - +changed.dataset.i];
+      const rest = Math.max(0, whole - (num(changed.value) || 0));
+      if (whole) other.value = fixed ? moneyIn(Math.round(rest * 100) / 100) : String(Math.round(rest));
+    }
+    form._fr = recFormFractions(form);
+  }
+}
+
+function payForm(r) {
+  return `<form data-form="payRec" class="stack">
+    <div class="sheet-head"><h3>${esc(r.name)}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <input type="hidden" name="id" value="${r.id}">
+    <input class="amount money" name="amount" inputmode="decimal" placeholder="${eur0(r.min_amount || 0)}–${eur0(r.max_amount || 0)}" required autofocus autocomplete="off">
+    <input type="date" name="spent_on" value="${todayStr()}" required>
+    <p class="muted" style="margin:0">${splitShares(r.split, 100).map(s => `${esc(s.user_id === uid() ? 'You' : memberName(s.user_id))} ${Math.round(s.amount)}%`).join(' · ')}</p>
+    <button class="btn primary">Add expense</button>
+  </form>`;
+}
+
 /* ───────────── Main render ───────────── */
 const TABS = [['home', 'home', 'Home'], ['stats', 'chart', 'Stats'], ['add'], ['savings', 'wallet', 'Savings'], ['settings', 'more', 'More']];
 function render() {
   const view = { home: viewHome, stats: viewStats, savings: viewSavings, settings: viewSettings }[S.tab]();
-  app.innerHTML = `<main class="view view-${S.tab}">${view}</main>
+  const budgetsScreen = S.tab === 'settings' && (S.f.settings || 'budgets') === 'budgets';
+  app.innerHTML = `<main class="view view-${S.tab}${budgetsScreen ? ' view-budgets' : ''}">${view}</main>
     <nav class="tabs">${TABS.map(([k, i, l]) => k === 'add'
       ? `<button class="tab add" data-act="add" aria-label="Add expense">${ic('plus', 24)}</button>`
       : `<button class="tab ${S.tab === k ? 'on' : ''}" data-tab="${k}">${ic(i, 21)}<small>${l}</small></button>`).join('')}</nav>`;
   updateCalc();
   updateBudgetLeft();
+  showBudgetPage();
   saveUISoon();
 }
 
@@ -318,7 +504,7 @@ function expItem(e) {
   return `<div class="item" data-act="edit" data-id="${e.id}">
     ${catBadge(c)}
     <div class="grow"><div class="ellipsis">${esc(e.note || c.name)}</div>
-      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}</div></div>
+      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}${e.recurring_id ? ' · Recurring' : e.split_id ? ' · Split' : ''}</div></div>
     <div class="amt">${eur(e.amount)}</div></div>`;
 }
 
@@ -342,7 +528,8 @@ function viewHome() {
   const daysLeft = isNow ? dim - day + 1 : 0;
   const pace = isNow ? day / dim : 1;
 
-  const ex = monthExp(), t = catTotals(ex), spendEx = spendOnly(ex);
+  const ex = monthExp(), spendEx = spendOnly(ex);
+  const t = catTotals(ex.filter(e => !e.recurring_id));   // categories don't include recurring bills
   const spent = sum(spendEx), budget = myBudgetTotal(), left = budget - spent;
   const savedPlan = mySavingBudget();
   const perDay = isNow ? Math.max(0, left) / daysLeft : null;
@@ -350,23 +537,25 @@ function viewHome() {
   const rows = S.cats.map(c => ({ c, spent: isSavingCat(c) ? savedInto(c) : (t[c.id] || 0), budget: budgetOf(c.id) })).filter(r => r.budget || r.spent);
   const savedNow = sum(rows.filter(r => isSavingCat(r.c)), r => r.spent);
   if (t.none) rows.push({ c: catOf(null), spent: t.none, budget: 0 });
+  const recBudget = recurringMonthly(), recSpent = sum(ex.filter(e => e.recurring_id));
+  if (recBudget || recSpent) rows.push({ rec: true, c: { name: 'Recurring bills', icon: 'clock', color: 'var(--brand)' }, spent: recSpent, budget: recBudget });
   const ratio = r => r.budget ? r.spent / r.budget : (r.spent ? 9 : 0);
   rows.sort((a, b) => ratio(b) - ratio(a));
 
-  const over = rows.filter(r => !isSavingCat(r.c) && r.budget && r.spent > r.budget);
-  const fast = isNow ? rows.filter(r => !isSavingCat(r.c) && r.budget && r.spent < r.budget && r.spent / r.budget > 0.5 && r.spent / r.budget > pace + 0.2) : [];
+  const over = rows.filter(r => !r.rec && !isSavingCat(r.c) && r.budget && r.spent > r.budget);
+  const fast = isNow ? rows.filter(r => !r.rec && !isSavingCat(r.c) && r.budget && r.spent < r.budget && r.spent / r.budget > 0.5 && r.spent / r.budget > pace + 0.2) : [];
 
   const budgetsBody = () => rows.length ? rows.map(r => {
       const sav = isSavingCat(r.c);
-      const isOver = !sav && (r.budget ? r.spent > r.budget : r.spent > 0);
+      const isOver = !sav && !r.rec && (r.budget ? r.spent > r.budget : r.spent > 0);
       const isFast = fast.includes(r);
-      const badge = isOver
-        ? `<div class="badge bad">${ic('alert', 13)} ${r.budget ? `Over budget by ${eur0(r.spent - r.budget)}` : 'No budget set'}</div>`
-        : isFast ? `<div class="badge warn">${ic('clock', 13)} Slow down: only ${eur0(r.budget - r.spent)} left for ${daysLeft} days</div>` : '';
-      return `<div class="cat ${isOver ? 'hl bad' : isFast ? 'hl warn' : ''}">
-        <div class="row between"><span class="cname">${catIc(r.c)} <span class="nm">${esc(r.c.name)}</span>${sav ? ` <span class="tag sav">${savingKind(r.c) === 'joint' ? 'Joint' : 'Savings'}</span>` : ''}</span>
+      // Compact warnings: a small tag on the same line instead of a separate box
+      const warn = isOver ? `<span class="tag over" title="Over budget">${r.budget ? `${eur0(r.spent - r.budget)} over` : 'no budget'}</span>`
+        : isFast ? `<span class="tag fast" title="${daysLeft} days to go">${eur0(r.budget - r.spent)} left</span>` : '';
+      return `<div class="cat">
+        <div class="row between"><span class="cname">${catIc(r.c)} <span class="nm">${esc(r.c.name)}</span>${sav ? ` <span class="tag sav">${savingKind(r.c) === 'joint' ? 'Joint' : 'Savings'}</span>` : ''}${warn}</span>
           <span class="amt">${eur0(r.spent)}<span class="muted"> / ${r.budget ? eur0(r.budget) : '—'}</span></span></div>
-        ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : sav ? 'var(--ok)' : 'var(--brand)')}${badge}</div>`;
+        ${bar(r.budget ? r.spent / r.budget : 1, null, isOver ? 'var(--bad)' : isFast ? 'var(--warn)' : sav ? 'var(--ok)' : 'var(--brand)')}</div>`;
     }).join('')
     : '<div class="empty">You have no budgets yet. Set them in More → Budgets.</div>';
 
@@ -386,6 +575,7 @@ function viewHome() {
   </div>
   ${folders('home', [
     { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', dot: over.length ? 'over' : fast.length ? 'warn' : '', body: budgetsBody },
+    { id: 'recurring', label: `${ic('clock', 14)} Recurring`, color: 'var(--brand)', dot: recurringDue() ? 'warn' : '', body: recurringBody },
     { id: 'expenses', label: `${ic('list', 14)} Expenses`, color: 'var(--brand)', body: expensesBody }
   ])}`;
 }
@@ -717,7 +907,7 @@ window.addEventListener('beforeunload', e => { if (S.budgetsDirty) { e.preventDe
 
 // Income minus budgets, per person, updated live while typing.
 function updateBudgetLeft() {
-  if (!document.querySelector('.paygrid')) return;
+  if (!document.querySelector('.paygrid [id^=left-]')) return;   // totals are now drawn straight from saved budgets
   S.members.forEach(m => {
     const pay = incomeOf(m);
     let acc = 0, sav = 0;
@@ -728,24 +918,110 @@ function updateBudgetLeft() {
     });
     document.getElementById('bud-' + m.user_id).textContent = eur0(acc);
     document.getElementById('sav-' + m.user_id).textContent = eur0(sav);
-    acc += sav;
+    acc += sav + recurringMonthly(m.user_id);
     const l = document.getElementById('left-' + m.user_id);
     l.textContent = pay ? eur0(pay - acc) : 'Add income';
     l.classList.toggle('neg', pay - acc < 0);
   });
 }
 
+// A budget list row, same look as the recurring bills: icon, name, each person's amount, total
+function catList(cats) {
+  return `<div class="list">${cats.length ? cats.map(c => `<div class="item" data-act="editCat" data-id="${c.id}">
+      ${catBadge(c)}
+      <div class="grow"><div class="ellipsis">${esc(c.name)}${savingKind(c) === 'joint' ? ' <span class="tag sav">Joint account</span>' : ''}</div>
+        <div class="muted">${S.members.map(m => `${esc(m.user_id === uid() ? 'You' : m.display_name)} ${eur0(budgetOf(c.id, m.user_id))}`).join(' · ')}</div></div>
+      <div class="amt">${eur0(sum(S.members, m => budgetOf(c.id, m.user_id)))}</div></div>`).join('')
+    : '<div class="empty">Nothing here yet.</div>'}</div>`;
+}
+// Add / edit a budget in a panel
+function catForm(c = {}) {
+  const kind = savingKind(c) || '';
+  return `<form data-form="catEdit" class="stack">
+    <div class="sheet-head"><h3>${c.id ? 'Edit budget' : kind ? 'New savings budget' : 'New spending category'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <input type="hidden" name="id" value="${c.id || ''}">
+    <input name="name" placeholder="Name (e.g. ${kind ? 'Holiday fund' : 'Supermarket'})" value="${esc(c.name || '')}" required maxlength="40" ${c.id ? '' : 'autofocus'}>
+    <label class="f">Icon</label>
+    <div class="iconpick">${CAT_ICONS.map(k => `<label><input type="radio" name="icon" value="${k}" ${(c.icon || 'box') === k ? 'checked' : ''}><span>${ic(k, 18)}</span></label>`).join('')}</div>
+    ${kind ? `<label class="f">Type</label>
+    <div class="seg typeseg"><label><input type="radio" name="saving_kind" value="personal" ${kind === 'personal' ? 'checked' : ''}><span>My savings</span></label>
+      <label><input type="radio" name="saving_kind" value="joint" ${kind === 'joint' ? 'checked' : ''}><span>Joint savings</span></label></div>`
+      : '<input type="hidden" name="saving_kind" value="">'}
+    <div class="grid2">${S.members.map(m => `<label class="spl"><small>${esc(m.user_id === uid() ? 'You' : m.display_name)} per month</small>
+      <input name="b_${m.user_id}" class="money" inputmode="decimal" autocomplete="off" placeholder="0" value="${c.id && budgetOf(c.id, m.user_id) ? moneyIn(budgetOf(c.id, m.user_id)) : ''}"></label>`).join('')}</div>
+    <button class="btn primary">${c.id ? 'Save' : 'Add'}</button>
+    ${c.id ? `<button type="button" class="btn danger" data-act="delCat" data-id="${c.id}">Delete</button>` : ''}
+  </form>`;
+}
+
+// Page title with a small "+ Add" button at the other end of the row
+const ptitle = (title, act, kind) => `<div class="ptitle-row"><p class="ptitle">${title}</p>
+  <button type="button" class="btn small addbtn" data-act="${act}"${kind != null ? ` data-kind="${kind}"` : ''}>${ic('plus', 14)} Add</button></div>`;
+
+// More → Budgets: three pages you swipe between (Spending, Recurring, Savings)
+function budgetPages() {
+  const spendCats = S.cats.filter(c => !isSavingCat(c)), savCats = S.cats.filter(isSavingCat);
+  const pages = [
+    ['Spending', `${ptitle('Spending', 'addCat', '')}${catList(spendCats)}`],
+    ['Recurring', `${ptitle('Recurring bills', 'addRecurring')}
+    <div class="list">${S.recurring.length ? [...S.recurring].sort((a, b) => monthlyOf(b) - monthlyOf(a)).map(r => `<div class="item" data-act="editRecurring" data-id="${r.id}">
+        ${catBadge(catOf(r.category_id))}
+        <div class="grow"><div class="ellipsis">${esc(r.name)}</div>
+          <div class="muted">${S.members.map(m => `${esc(m.user_id === uid() ? 'You' : m.display_name)} ${eur0(monthlyOf(r) * fractionOf(r, m.user_id))}`).join(' · ')}</div></div>
+        <div class="amt">${isFixed(r) && r.repeat !== 'days' ? eur(r.amount) : '≈ ' + eur0(monthlyOf(r))}</div></div>`).join('')
+      : '<div class="empty">No recurring bills yet.</div>'}</div>`],
+    ['Savings', `${ptitle('Savings', 'addCat', 'personal')}${catList(savCats)}`]
+  ];
+  const cur = Math.min(S.bPage || 0, 2);
+  return `<div class="pager" id="bpager">${pages.map(pg => `<section class="page">${pg[1]}</section>`).join('')}</div>
+    <div class="dots">${pages.map((pg, i) => `<button type="button" class="pdot ${i === cur ? 'on' : ''}" data-act="budgetPage" data-i="${i}" aria-label="${pg[0]}"></button>`).join('')}</div>`;
+}
+// Swipe left/right between the budget pages.
+let swipe = null;
+document.addEventListener('touchstart', e => {
+  const pager = e.target.closest?.('#bpager');
+  if (!pager || e.touches.length !== 1) { swipe = null; return; }
+  swipe = { x: e.touches[0].clientX, y: e.touches[0].clientY, page: S.bPage || 0, t: Date.now() };
+}, { passive: true });
+document.addEventListener('touchend', e => {
+  if (!swipe) return;
+  const dx = e.changedTouches[0].clientX - swipe.x, dy = e.changedTouches[0].clientY - swipe.y;
+  const start = swipe.page; swipe = null;
+  if (Math.abs(dx) < 40 || Math.abs(dx) < Math.abs(dy) * 1.3) return;   // not a sideways swipe
+  const to = Math.max(0, Math.min(2, start + (dx < 0 ? 1 : -1)));
+  ACTIONS.budgetPage({ i: to });
+}, { passive: true });
+
+// Keep the page you were on, and keep the dots in step while swiping.
+function showBudgetPage() {
+  const pager = document.getElementById('bpager');
+  if (pager) pager.scrollLeft = (S.bPage || 0) * pager.clientWidth;
+}
+document.addEventListener('scroll', e => {
+  if (e.target.id !== 'bpager') return;
+  const pager = e.target, i = Math.round(pager.scrollLeft / Math.max(1, pager.clientWidth));
+  if (i !== S.bPage) {
+    S.bPage = i;
+    document.querySelectorAll('.dots .pdot').forEach((b, j) => b.classList.toggle('on', j === i));
+    saveUISoon();
+  }
+}, { capture: true, passive: true });
+
 function viewSettings() {
   const me = S.members.find(m => m.user_id === uid()) || {}, h = S.household;
   const youBody = () => `<form data-form="profile">
       <label class="f">Name</label><input name="display_name" value="${esc(me.display_name)}" required>
-      <label class="f">Monthly income, after tax (€)</label>
-      <input name="monthly_income" class="money" inputmode="decimal" autocomplete="off" value="${+me.monthly_income ? moneyIn(me.monthly_income) : ''}">
-      <label class="f">Extras per month (€) · e.g. supermarket card, not counted for bonuses</label>
-      <input name="extra_income" class="money" inputmode="decimal" autocomplete="off" value="${+me.extra_income ? moneyIn(me.extra_income) : ''}" placeholder="0">
-      <label class="f">My own savings goal (€)</label>
-      <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+me.savings_goal ? moneyIn(me.savings_goal) : ''}" placeholder="e.g. 60.000">
-      <label class="f">My goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}">
+      <div class="grid2 pair">
+        <div><label class="f">Income / month</label>
+          <input name="monthly_income" class="money" inputmode="decimal" autocomplete="off" placeholder="after tax" value="${+me.monthly_income ? moneyIn(me.monthly_income) : ''}"></div>
+        <div><label class="f">Extras / month</label>
+          <input name="extra_income" class="money" inputmode="decimal" autocomplete="off" placeholder="e.g. supermarket card" value="${+me.extra_income ? moneyIn(me.extra_income) : ''}"></div>
+      </div>
+      <div class="grid2 pair">
+        <div><label class="f">My savings goal</label>
+          <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+me.savings_goal ? moneyIn(me.savings_goal) : ''}" placeholder="e.g. 60.000"></div>
+        <div><label class="f">Goal date</label><input name="goal_date" type="date" value="${me.goal_date || ''}"></div>
+      </div>
       <label class="bonusrow" style="background:var(--card2);border-radius:10px;margin-top:10px"><span class="bi">${ic('heart', 18)}</span>
         <span class="grow">Child savings account<small>Money from my parents. Only I can add to it.</small></span>
         <input type="checkbox" class="switch" name="child_account" ${me.child_account ? 'checked' : ''}></label>
@@ -755,26 +1031,29 @@ function viewSettings() {
     <button class="btn danger" data-act="signout">Sign out</button>`;
   const homeBody = () => `<form data-form="household">
       <label class="f">Name</label><input name="name" value="${esc(h.name)}" required>
-      <label class="f">Savings goal together (€)</label>
-      <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+h.savings_goal ? moneyIn(h.savings_goal) : ''}" placeholder="e.g. 100.000">
-      <label class="f">Goal date together</label><input name="goal_date" type="date" value="${h.goal_date || ''}">
+      <div class="grid2 pair">
+        <div><label class="f">Savings goal together</label>
+          <input name="savings_goal" class="money" inputmode="decimal" autocomplete="off" value="${+h.savings_goal ? moneyIn(h.savings_goal) : ''}" placeholder="e.g. 100.000"></div>
+        <div><label class="f">Goal date</label><input name="goal_date" type="date" value="${h.goal_date || ''}"></div>
+      </div>
       <button class="btn primary">Save</button>
     </form>
     <label class="f">Invite code: your partner enters this after creating an account</label>
     <div class="row between"><span class="code">${esc(h.invite_code)}</span><button class="btn small" data-act="copyCode">Copy</button></div>
-    <p class="muted">Members: ${S.members.map(m => esc(m.display_name)).join(', ')}</p>`;
+    <p class="muted">Members: ${S.members.map(m => esc(m.display_name)).join(', ')}</p>
+    <button class="btn" data-act="export">Export expenses (CSV, last 6 months)</button>`;
   const budgetsBody = () => `<div class="paygrid">${S.members.map(m => `<div class="paybox">
         <div class="t1">${esc(m.user_id === uid() ? 'You' : m.display_name)}</div>
         <div class="row between"><span>Income</span><span class="amt">${+m.monthly_income ? eur0(m.monthly_income) : '—'}</span></div>
         ${+m.extra_income ? `<div class="row between"><span>Extras</span><span class="amt">${eur0(m.extra_income)}</span></div>` : ''}
-        <div class="row between"><span>Spending</span><span class="amt" id="bud-${m.user_id}"></span></div>
-        <div class="row between"><span>Savings</span><span class="amt" id="sav-${m.user_id}"></span></div>
-        <div class="row between left"><span>Left</span><span class="amt" id="left-${m.user_id}"></span></div>
+        <div class="row between"><span>Spending</span><span class="amt">${eur0(catBudgetTotal(m.user_id))}</span></div>
+        <div class="row between"><span>Recurring</span><span class="amt">${eur0(recurringMonthly(m.user_id))}</span></div>
+        <div class="row between"><span>Savings</span><span class="amt">${eur0(mySavingBudget(m.user_id))}</span></div>
+        ${(() => { const left = incomeOf(m) - catBudgetTotal(m.user_id) - recurringMonthly(m.user_id) - mySavingBudget(m.user_id);
+          return `<div class="row between left"><span>Left</span><span class="amt ${left < 0 ? 'neg' : ''}">${incomeOf(m) ? eur0(left) : 'Add income'}</span></div>`; })()}
       </div>`).join('')}</div>
-    ${S.cats.map(catRow).join('')}${catRow({})}
-    <div class="savebar ${S.budgetsDirty ? 'dirty' : ''}"><span class="sb-text">${S.budgetsDirty ? 'Unsaved changes' : 'All changes saved'}</span>
-      <button type="button" class="btn small primary" data-act="saveBudgets" ${S.budgetsDirty ? '' : 'disabled'}>${ic('check', 15)} Save</button></div>
-    <button class="btn" data-act="export">Export expenses (CSV, last 6 months)</button>`;
+    ${budgetPages()}
+`;
 
   return `${folders('settings', [
     { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', body: budgetsBody },
@@ -823,6 +1102,25 @@ function closeSheet() {
 const whoToggle = (name, sel = uid()) => `<div class="seg">${[...S.members].sort((a, b) => (b.user_id === uid()) - (a.user_id === uid())).map(m =>
   `<label><input type="radio" name="${name}" value="${m.user_id}" ${m.user_id === sel ? 'checked' : ''}><span>${m.user_id === uid() ? 'Me' : esc(m.display_name)}</span></label>`).join('')}</div>`;
 
+const partnerOf = () => S.members.find(m => m.user_id !== uid());
+// Split a new expense: typing one part fills in the other; untouched, it's half each.
+function syncExpenseSplit(form, changed) {
+  const row = form.querySelector('.splitrow');
+  if (!row) return;
+  const split = form.querySelector('[name=mode]:checked')?.value === 'split';
+  row.classList.toggle('hidden', !split);
+  const total = num(form.querySelector('[name=amount]').value) || 0;
+  const mine = form.querySelector('[name=my_share]'), theirs = form.querySelector('[name=their_share]');
+  if (changed === mine || changed === theirs) {
+    form._touched = true;
+    const other = changed === mine ? theirs : mine;
+    other.value = total ? moneyIn(Math.max(0, Math.round((total - (num(changed.value) || 0)) * 100) / 100)) : '';
+  } else if (split && (!form._touched || changed?.name === 'amount')) {
+    const m = form._touched && total ? Math.min(total, num(mine.value) || 0) : Math.round(total * 50) / 100;
+    mine.value = total ? moneyIn(m) : '';
+    theirs.value = total ? moneyIn(Math.round((total - m) * 100) / 100) : '';
+  }
+}
 function expenseForm(e = {}) {
   const cats = S.cats.filter(c => !isSavingCat(c) || c.id === e.category_id);
   const sel = e.category_id || (cats.some(c => c.id === S.lastCat) ? S.lastCat : cats[0]?.id);
@@ -833,7 +1131,13 @@ function expenseForm(e = {}) {
     <div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
     <input name="note" placeholder="Note (e.g. souvlaki, Lidl)" value="${esc(e.note || '')}" maxlength="120">
     <input type="date" name="spent_on" value="${e.spent_on || todayStr()}" required>
-    ${whoToggle('paid_by', e.paid_by || uid())}
+    <input type="hidden" name="paid_by" value="${e.paid_by || uid()}">
+    ${!e.id && partnerOf() ? `<div class="seg"><label><input type="radio" name="mode" value="mine" checked><span>${ic('user', 14)} Mine</span></label>
+      <label><input type="radio" name="mode" value="split"><span>${ic('users', 14)} Split</span></label></div>
+    <div class="splitrow hidden"><div class="grid2">
+      <label class="spl"><small>You pay</small><input name="my_share" class="money" inputmode="decimal" autocomplete="off"></label>
+      <label class="spl"><small>${esc(partnerOf().display_name)} pays</small><input name="their_share" class="money" inputmode="decimal" autocomplete="off"></label></div></div>` : ''}
+    ${e.id && e.split_id ? `<p class="muted" style="margin:0">Split expense. Deleting removes both parts.</p>` : ''}
     <button class="btn primary">${e.id ? 'Save' : 'Add expense'}</button>
     ${e.id ? `<button type="button" class="btn danger" data-act="delExpense" data-id="${e.id}">Delete</button>` : ''}
   </form>`;
@@ -869,8 +1173,27 @@ const ACTIONS = {
   prevMonth: async () => { S.month = addMonths(S.month, -1); await refresh(); },
   nextMonth: async () => { const n = addMonths(S.month, 1); if (n <= monthKey(new Date())) { S.month = n; await refresh(); } },
   delExpense: async d => {
-    if (!confirm('Delete this expense?')) return;
-    await q(sb.from('expenses').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
+    const e = S.exp.find(x => x.id === d.id);
+    if (!confirm(e?.split_id ? 'Delete this split expense? Both parts are removed.' : 'Delete this expense?')) return;
+    await q(e?.split_id ? sb.from('expenses').delete().eq('split_id', e.split_id) : sb.from('expenses').delete().eq('id', d.id));
+    closeSheet(); await refresh('Deleted');
+  },
+  addRecurring: () => { if (S.tab === 'settings' && !okToLeave()) return; openSheet(recurringForm()); },
+  editRecurring: d => { if (S.tab === 'settings' && !okToLeave()) return; const r = S.recurring.find(x => x.id === d.id); if (r) openSheet(recurringForm(r)); },
+  payRecurring: d => { const r = S.recurring.find(x => x.id === d.id); if (r) openSheet(payForm(r)); },
+  skipRecurring: async d => {
+    const r = S.recurring.find(x => x.id === d.id); if (!r) return;
+    await q(sb.from('recurring').update({ next_due: nextDue(r, r.next_due) }).eq('id', r.id).eq('next_due', r.next_due));
+    closeSheet(); await refresh('Skipped');
+  },
+  delRecurring: async d => {
+    if (!confirm('Delete this recurring bill? Expenses already added stay.')) return;
+    await q(sb.from('recurring').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
+  },
+  recSplit: (d, btn) => {
+    const form = btn.closest('form');
+    const fr = S.members.map(m => d.who === 'half' ? 1 / S.members.length : (m.user_id === d.who ? 1 : 0));
+    setRecSplit(form, fr); form._fr = fr;
   },
   addSaving: d => openSheet(savingForm({}, d.kind)),
   editSaving: d => { const s = S.sav.find(x => x.id === d.id); if (s && canEditSaving(s)) openSheet(savingForm(s)); },
@@ -903,12 +1226,21 @@ const ACTIONS = {
       await refresh('Budgets saved');
     } finally { if (btn && btn.isConnected) btn.disabled = !S.budgetsDirty; }
   },
+  addCat: d => openSheet(catForm(d.kind ? { saving_kind: d.kind } : {})),
+  editCat: d => { const c = S.cats.find(x => x.id === d.id); if (c) openSheet(catForm(c)); },
   delCat: async d => {
     if (!confirm(S.budgetsDirty ? 'Delete this category? Your other unsaved changes will be lost.' : 'Delete this category? Its expenses become "Uncategorised".')) return;
     S.budgetsDirty = false;
-    await q(sb.from('categories').delete().eq('id', d.id)); await refresh('Category deleted');
+    await q(sb.from('categories').delete().eq('id', d.id)); closeSheet(); await refresh('Deleted');
   },
   savMode: d => { S.savMode = d.mode; render(); },
+  budgetPage: d => {
+    S.bPage = +d.i;
+    document.querySelectorAll('.dots .pdot').forEach((b, j) => b.classList.toggle('on', j === S.bPage));
+    saveUISoon();
+    const pager = document.getElementById('bpager');
+    if (pager) pager.scrollTo({ left: S.bPage * pager.clientWidth, behavior: 'smooth' });
+  },
   joinTab: d => { S.joinTab = d.id; renderJoin(); },
   toggleSavCat: (d, btn) => {
     const input = btn.closest('form').querySelector('input[name=saving_kind]');
@@ -963,6 +1295,16 @@ const FORMS = {
   expense: async fd => {
     const amount = num(fd.get('amount'));
     if (!(amount > 0)) return toast('Enter an amount');
+    if (fd.get('mode') === 'split' && !fd.get('id')) {
+      const total = Math.round(amount * 100) / 100;
+      const mine = fd.get('my_share') ? Math.round(num(fd.get('my_share')) * 100) / 100 : Math.round(total * 50) / 100;
+      if (!(mine >= 0) || mine > total) return toast("Your part can't be more than the total");
+      await addSplitExpenses({ amount: total, category_id: fd.get('category_id') || null, note: fd.get('note').trim() || null, spent_on: fd.get('spent_on'),
+        shares: [{ user_id: uid(), amount: mine }, { user_id: partnerOf().user_id, amount: Math.round((total - mine) * 100) / 100 }].filter(s => s.amount > 0) });
+      S.lastCat = fd.get('category_id');
+      closeSheet();
+      return refresh(`Split ${eur(total)}`);
+    }
     const row = {
       household_id: S.household.id, amount: Math.round(amount * 100) / 100,
       category_id: fd.get('category_id') || null, note: fd.get('note').trim() || null,
@@ -974,6 +1316,55 @@ const FORMS = {
     S.lastCat = row.category_id;
     closeSheet();
     await refresh(id ? 'Saved' : `Added ${eur(row.amount)}`);
+  },
+  catEdit: async fd => {
+    const name = (fd.get('name') || '').trim();
+    if (!name) return toast('Enter a name');
+    const kind = fd.get('saving_kind') || null;
+    const row = { name, icon: fd.get('icon') || 'box', saving_kind: kind, is_saving: !!kind };
+    let id = fd.get('id');
+    if (id) await q(sb.from('categories').update(row).eq('id', id));
+    else id = (await q(sb.from('categories').insert({ ...row, household_id: S.household.id, sort: S.cats.length + 1, color: PALETTE[S.cats.length % PALETTE.length] }).select().single())).id;
+    await q(sb.from('budgets').upsert(S.members.map(m => ({ household_id: S.household.id, category_id: id, user_id: m.user_id, amount: num(fd.get('b_' + m.user_id)) || 0 })), { onConflict: 'category_id,user_id' }));
+    closeSheet();
+    await refresh(fd.get('id') ? 'Saved' : 'Added');
+  },
+  recurring: async fd => {
+    const fixed = fd.get('kind') === 'fixed';
+    const amount = num(fd.get('amount')), minA = num(fd.get('min_amount')) || 0, maxA = num(fd.get('max_amount'));
+    if (fixed && !(amount > 0)) return toast('Enter the amount');
+    if (!fixed && !(maxA > 0)) return toast('Enter the usual range, e.g. 15 to 80');
+    const repeat = fd.get('repeat') === 'days' ? 'days' : 'monthly';
+    const every = parseInt(fd.get('every_days'), 10) || 0;
+    if (repeat === 'days' && every < 1) return toast('Enter every how many days');
+    // No dates to manage: a new bill is tracked from this month (monthly ones on the 1st), or from today.
+    const old = S.recurring.find(x => x.id === fd.get('id'));
+    const sameRepeat = old && old.repeat === repeat && (repeat !== 'days' || +old.every_days === every);
+    const next = sameRepeat ? old.next_due : (repeat === 'monthly' ? monthKey(new Date()) + '-01' : todayStr());
+    const vals = S.members.map(m => num(fd.get('sp_' + m.user_id)) || 0), tot = vals.reduce((a, b) => a + b, 0);
+    const split = {};
+    S.members.forEach((m, i) => { split[m.user_id] = tot > 0 ? Math.round(vals[i] / tot * 10000) / 10000 : 1 / S.members.length; });
+    const row = {
+      household_id: S.household.id, name: fd.get('name').trim(), category_id: fd.get('category_id') || null,
+      amount: fixed ? Math.round(amount * 100) / 100 : null, min_amount: fixed ? null : minA, max_amount: fixed ? null : maxA,
+      repeat, every_days: repeat === 'days' ? every : null, day_of_month: repeat === 'monthly' ? 1 : null,
+      next_due: next, split
+    };
+    const id = fd.get('id');
+    if (id) await q(sb.from('recurring').update(row).eq('id', id));
+    else await q(sb.from('recurring').insert(row));
+    closeSheet();
+    await loadData();
+    const added = await processRecurring().catch(() => 0);
+    await refresh(added ? `Saved and added ${added} payment${added > 1 ? 's' : ''}` : 'Saved');
+  },
+  payRec: async fd => {
+    const r = S.recurring.find(x => x.id === fd.get('id')); if (!r) return;
+    const amount = num(fd.get('amount'));
+    if (!(amount > 0)) return toast('Enter the amount');
+    await addSplitExpenses({ amount: Math.round(amount * 100) / 100, category_id: r.category_id, note: r.name, spent_on: fd.get('spent_on'), shares: splitShares(r.split, Math.round(amount * 100) / 100), recurring_id: r.id });
+    closeSheet();
+    await refresh(`Added ${eur(amount)}`);
   },
   saving: async fd => {
     const amount = num(fd.get('amount'));
@@ -1026,11 +1417,17 @@ document.addEventListener('submit', async e => {
   catch (err) { console.error(err); }
   finally { if (btn && btn.isConnected) btn.disabled = false; }
 });
+document.addEventListener('change', e => {
+  const rf = e.target.closest('form[data-form=recurring]'); if (rf && e.target.type === 'radio') syncRecurringForm(rf, e.target);
+  const ef = e.target.closest('form[data-form=expense]'); if (ef && e.target.type === 'radio') syncExpenseSplit(ef, e.target);
+});
 document.addEventListener('focusout', e => {
   const el = e.target;
   if (el.classList?.contains('money') && el.value.trim() !== '' && !isNaN(num(el.value))) el.value = moneyIn(num(el.value));
 });
-document.addEventListener('input', e => { if (e.target.name === 'includeChild') { updateCalc(); render(); return; } if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) { markBudgetsDirty(); updateBudgetLeft(); } });
+document.addEventListener('input', e => {
+  const rf = e.target.closest('form[data-form=recurring]'); if (rf) syncRecurringForm(rf, e.target);
+  const ef = e.target.closest('form[data-form=expense]'); if (ef) syncExpenseSplit(ef, e.target); if (e.target.name === 'includeChild') { updateCalc(); render(); return; } if (e.target.closest('#calc')) updateCalc(); if (e.target.closest('form.catedit')) { markBudgetsDirty(); updateBudgetLeft(); } });
 
 if ('serviceWorker' in navigator) navigator.serviceWorker.register('./sw.js').catch(() => {});
 init();
