@@ -455,3 +455,4 @@ form:has(.typeseg input[value="joint"]:checked) .typehint .h-joint { display: in
 .tag.over { color: var(--bad); background: color-mix(in srgb, var(--bad) 13%, transparent); }
 .tag.fast { color: color-mix(in srgb, var(--warn) 70%, var(--text)); background: color-mix(in srgb, var(--warn) 16%, transparent); }
 .cat:has(.tag.over) .amt { color: var(--bad); }
+.paidtag { display: inline-flex; align-items: center; gap: 3px; font-size: 11.5px; font-weight: 600; color: var(--ok); }

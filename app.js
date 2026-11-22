@@ -99,10 +99,21 @@ const ICONS = {
   down: '<path d="M12 4v14M6 12l6 6 6-6"/>',
   up: '<path d="M12 20V6M6 12l6-6 6 6"/>',
   bulb: '<path d="M9 18h6M10 21h4"/><path d="M12 3a6 6 0 0 0-3.5 10.9c.6.5 1 1.2 1 2.1h5c0-.9.4-1.6 1-2.1A6 6 0 0 0 12 3z"/>',
-  logo: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><circle cx="12" cy="15" r="2.5"/>'
+  logo: '<path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V21h14V9.5"/><circle cx="12" cy="15" r="2.5"/>',
+  tv: '<rect x="2" y="6" width="20" height="13" rx="2"/><path d="M8 2l4 4 4-4"/>',
+  wifi: '<path d="M2 8.8a15 15 0 0 1 20 0"/><path d="M5 12.6a10 10 0 0 1 14 0"/><path d="M8.5 16.3a5 5 0 0 1 7 0"/><path d="M12 20h.01"/>',
+  building: '<rect x="4" y="2" width="16" height="20" rx="1.5"/><path d="M9 22v-4h6v4"/><path d="M8 6h.01M12 6h.01M16 6h.01M8 10h.01M12 10h.01M16 10h.01M8 14h.01M12 14h.01M16 14h.01"/>',
+  pill: '<path d="M10.5 20.5a5 5 0 0 1-7-7l10-10a5 5 0 0 1 7 7z"/><path d="M8.5 8.5l7 7"/>',
+  droplet: '<path d="M12 2.7 6.3 8.4a8 8 0 1 0 11.4 0z"/>',
+  flame: '<path d="M12 22c4 0 7-3 7-7 0-4-3-6-4-9-1 2-2 3-4 3 0-2-1-4-2-6-2 3-4 6-4 10s3 9 7 9z"/>',
+  music: '<path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/>',
+  film: '<rect x="2" y="3" width="20" height="18" rx="2"/><path d="M7 3v18M17 3v18M2 9h5M2 15h5M17 9h5M17 15h5"/>',
+  shield: '<path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>'
 };
 // Icons offered for categories (tap the icon in More → Budgets to change it)
 const CAT_ICONS = ['home', 'bolt', 'cart', 'utensils', 'paw', 'car', 'wine', 'user', 'box', 'gift', 'heart', 'shirt', 'plane', 'phone', 'book', 'dumbbell', 'coffee', 'game', 'health', 'card'];
+// Icons offered for recurring bills
+const REC_ICONS = ['home', 'building', 'bolt', 'droplet', 'flame', 'wifi', 'tv', 'phone', 'music', 'film', 'pill', 'paw', 'health', 'shield', 'car', 'card', 'dumbbell', 'book', 'box', 'heart'];
 const ic = (name, size = 18) => `<svg class="ic" width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.box}</svg>`;
 // Category icon: a line icon if it's one of ours, otherwise whatever text was saved
 const catIc = (c, size = 16) => ICONS[c.icon] ? ic(c.icon, size) : `<span>${esc(c.icon || '')}</span>`;
@@ -192,7 +203,6 @@ async function boot() {
     await loadHousehold();
     if (!S.household) return renderJoin();
     await loadData();
-    if (await processRecurring().catch(() => 0)) await loadData();   // add fixed bills that came due
     subscribe();
     render();
     if (S.restoreScroll) {   // put you back where you were
@@ -236,7 +246,7 @@ let reloadTimer;
 function scheduleReload() {
   clearTimeout(reloadTimer);
   reloadTimer = setTimeout(async () => {
-    try { await loadData(); if (await processRecurring().catch(() => 0)) await loadData(); if (!isTyping() && !S.budgetsDirty) render(); } catch {}
+    try { await loadData(); if (!isTyping() && !S.budgetsDirty) render(); } catch {}
   }, 500);
 }
 function subscribe() {
@@ -360,24 +370,28 @@ async function processRecurring() {
   return added;
 }
 
-function recItem(r) {
-  const c = catOf(r.category_id);
-  const freq = r.repeat === 'days' ? `Every ${r.every_days} days` : 'Monthly';
-  const mine = myFraction(r);
-  const thisMonth = S.exp.filter(e => e.recurring_id === r.id && e.spent_on.startsWith(monthKey(new Date())));
-  const addedTotal = sum(thisMonth), addedMine = sum(thisMonth.filter(e => e.paid_by === uid()));
-  let right;
-  if (!isFixed(r) && !thisMonth.length) {
-    right = `<button class="btn small primary" data-act="payRecurring" data-id="${r.id}">Add</button>`;
-  } else if (!isFixed(r)) {
-    right = `<div class="amt">${eur(addedMine)}</div>${mine < 0.999 ? `<div class="muted">of ${eur(addedTotal)}</div>` : ''}`;
-  } else if (mine < 0.001) {
-    right = `<div class="muted">${esc(memberName(splitShares(r.split, 100)[0]?.user_id))} pays</div><div class="muted">${eur(r.amount)}</div>`;
-  } else {
-    right = `<div class="amt">${eur(+r.amount * mine)}</div>${mine < 0.999 ? `<div class="muted">of ${eur(r.amount)}</div>` : ''}`;
+// A bill's own icon (falls back to its category's icon)
+const recBadge = r => catBadge({ icon: r.icon || (r.category_id ? catOf(r.category_id).icon : 'home'), color: 'var(--brand)' });
+// Expenses that already paid this bill for the current period (this month, or the last X days)
+function paidNow(r) {
+  const list = S.exp.filter(e => e.recurring_id === r.id);
+  if (r.repeat === 'days') {
+    const last = list.map(e => e.spent_on).sort().pop();
+    return last && daysBetween(last, todayStr()) < Math.max(1, +r.every_days || 30) ? list.filter(e => e.spent_on === last) : [];
   }
-  const sub = !isFixed(r) ? `${freq} · ${thisMonth.length ? 'added this month' : `usually ${eur0(r.min_amount || 0)}–${eur0(r.max_amount || 0)}`}` : freq;
-  return `<div class="item" data-act="editRecurring" data-id="${r.id}">${catBadge(c)}
+  return list.filter(e => e.spent_on.startsWith(monthKey(new Date())));
+}
+function recItem(r) {
+  const freq = r.repeat === 'days' ? `Every ${r.every_days} days` : 'Monthly';
+  const mine = myFraction(r), paid = paidNow(r);
+  const paidMine = sum(paid.filter(e => e.paid_by === uid())), paidTotal = sum(paid);
+  const typical = isFixed(r) ? eur(+r.amount * mine) : `${eur0((+r.min_amount || 0) * mine)}–${eur0((+r.max_amount || 0) * mine)}`;
+  const right = paid.length
+    ? (paidMine ? `<div class="amt">${eur(paidMine)}</div><div class="paidtag">${ic('check', 12)} Paid</div>`
+      : `<div class="paidtag">${ic('check', 12)} ${esc(memberName(paid[0].paid_by))} paid</div>`)
+    : `<button class="btn small primary" data-act="${isFixed(r) ? 'markPaid' : 'payRecurring'}" data-id="${r.id}">Paid</button>`;
+  const sub = `${freq} · ${paid.length ? (mine < 0.999 ? `of ${eur(paidTotal)}` : 'this month') : mine < 0.001 ? `${esc(memberName(splitShares(r.split, 100)[0]?.user_id))} pays` : `you ${typical}`}`;
+  return `<div class="item" data-act="editRecurring" data-id="${r.id}">${recBadge(r)}
     <div class="grow"><div class="ellipsis">${esc(r.name)}</div><div class="muted">${sub}</div></div>
     <div class="recamt">${right}</div></div>`;
 }
@@ -400,7 +414,8 @@ function recurringForm(r = {}) {
     <div class="sheet-head"><h3>${r.id ? 'Edit recurring bill' : 'New recurring bill'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
     <input type="hidden" name="id" value="${r.id || ''}">
     <input name="name" placeholder="Name (e.g. Rent, Internet, Cat vitamins)" value="${esc(r.name || '')}" required maxlength="60" ${r.id ? '' : 'autofocus'}>
-    <div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
+    <label class="f">Icon</label>
+    <div class="iconpick">${REC_ICONS.map(k => `<label><input type="radio" name="icon" value="${k}" ${(r.icon || (r.category_id ? catOf(r.category_id).icon : 'home')) === k ? 'checked' : ''}><span>${ic(k, 18)}</span></label>`).join('')}</div>
     <div class="seg"><label><input type="radio" name="kind" value="fixed" ${fixed ? 'checked' : ''}><span>Fixed price</span></label>
       <label><input type="radio" name="kind" value="varies" ${fixed ? '' : 'checked'}><span>Varies</span></label></div>
     <div class="only-fixed"><input name="amount" class="money" inputmode="decimal" autocomplete="off" placeholder="Amount (€)" value="${isFixed(r) ? moneyIn(r.amount) : ''}"></div>
@@ -500,11 +515,12 @@ function catTotals(ex) {
 }
 
 function expItem(e) {
-  const c = catOf(e.category_id);
+  const bill = e.recurring_id && S.recurring.find(r => r.id === e.recurring_id);
+  const c = e.recurring_id ? { name: 'Recurring bill', icon: bill ? (bill.icon || (bill.category_id ? catOf(bill.category_id).icon : 'home')) : 'clock', color: 'var(--brand)' } : catOf(e.category_id);
   return `<div class="item" data-act="edit" data-id="${e.id}">
     ${catBadge(c)}
     <div class="grow"><div class="ellipsis">${esc(e.note || c.name)}</div>
-      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}${e.recurring_id ? ' · Recurring' : e.split_id ? ' · Split' : ''}</div></div>
+      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}${!e.recurring_id && e.split_id ? ' · Split' : ''}</div></div>
     <div class="amt">${eur(e.amount)}</div></div>`;
 }
 
@@ -965,7 +981,7 @@ function budgetPages() {
     ['Spending', `${ptitle('Spending', 'addCat', '')}${catList(spendCats)}`],
     ['Recurring', `${ptitle('Recurring bills', 'addRecurring')}
     <div class="list">${S.recurring.length ? [...S.recurring].sort((a, b) => monthlyOf(b) - monthlyOf(a)).map(r => `<div class="item" data-act="editRecurring" data-id="${r.id}">
-        ${catBadge(catOf(r.category_id))}
+        ${recBadge(r)}
         <div class="grow"><div class="ellipsis">${esc(r.name)}</div>
           <div class="muted">${S.members.map(m => `${esc(m.user_id === uid() ? 'You' : m.display_name)} ${eur0(monthlyOf(r) * fractionOf(r, m.user_id))}`).join(' · ')}</div></div>
         <div class="amt">${isFixed(r) && r.repeat !== 'days' ? eur(r.amount) : '≈ ' + eur0(monthlyOf(r))}</div></div>`).join('')
@@ -1128,7 +1144,8 @@ function expenseForm(e = {}) {
     <div class="sheet-head"><h3>${e.id ? 'Edit expense' : 'New expense'}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
     <input type="hidden" name="id" value="${e.id || ''}">
     <input class="amount money" name="amount" inputmode="decimal" placeholder="0 €" value="${e.amount != null ? moneyIn(e.amount) : ''}" required autofocus autocomplete="off">
-    <div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>
+    ${e.recurring_id ? '<input type="hidden" name="category_id" value="">'
+      : `<div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>`}
     <input name="note" placeholder="Note (e.g. souvlaki, Lidl)" value="${esc(e.note || '')}" maxlength="120">
     <input type="date" name="spent_on" value="${e.spent_on || todayStr()}" required>
     <input type="hidden" name="paid_by" value="${e.paid_by || uid()}">
@@ -1180,6 +1197,12 @@ const ACTIONS = {
   },
   addRecurring: () => { if (S.tab === 'settings' && !okToLeave()) return; openSheet(recurringForm()); },
   editRecurring: d => { if (S.tab === 'settings' && !okToLeave()) return; const r = S.recurring.find(x => x.id === d.id); if (r) openSheet(recurringForm(r)); },
+  markPaid: async (d, btn) => {
+    const r = S.recurring.find(x => x.id === d.id); if (!r || !isFixed(r)) return;
+    if (btn) btn.disabled = true;
+    await addSplitExpenses({ amount: +r.amount, category_id: null, note: r.name, spent_on: todayStr(), shares: splitShares(r.split, +r.amount), recurring_id: r.id });
+    await refresh(`${r.name} paid`);
+  },
   payRecurring: d => { const r = S.recurring.find(x => x.id === d.id); if (r) openSheet(payForm(r)); },
   skipRecurring: async d => {
     const r = S.recurring.find(x => x.id === d.id); if (!r) return;
@@ -1266,7 +1289,7 @@ const ACTIONS = {
   },
   export: () => {
     const rows = [['date', 'amount', 'category', 'note', 'paid_by']].concat(
-      S.exp.map(e => [e.spent_on, e.amount, catOf(e.category_id).name, e.note || '', memberName(e.paid_by)]));
+      S.exp.map(e => [e.spent_on, e.amount, e.recurring_id ? 'Recurring bill' : catOf(e.category_id).name, e.note || '', memberName(e.paid_by)]));
     const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
     const a = document.createElement('a');
     a.href = URL.createObjectURL(new Blob(['﻿' + csv], { type: 'text/csv' }));
@@ -1345,7 +1368,7 @@ const FORMS = {
     const split = {};
     S.members.forEach((m, i) => { split[m.user_id] = tot > 0 ? Math.round(vals[i] / tot * 10000) / 10000 : 1 / S.members.length; });
     const row = {
-      household_id: S.household.id, name: fd.get('name').trim(), category_id: fd.get('category_id') || null,
+      household_id: S.household.id, name: fd.get('name').trim(), category_id: null, icon: fd.get('icon') || null,   // bills aren't budget categories
       amount: fixed ? Math.round(amount * 100) / 100 : null, min_amount: fixed ? null : minA, max_amount: fixed ? null : maxA,
       repeat, every_days: repeat === 'days' ? every : null, day_of_month: repeat === 'monthly' ? 1 : null,
       next_due: next, split
@@ -1354,15 +1377,13 @@ const FORMS = {
     if (id) await q(sb.from('recurring').update(row).eq('id', id));
     else await q(sb.from('recurring').insert(row));
     closeSheet();
-    await loadData();
-    const added = await processRecurring().catch(() => 0);
-    await refresh(added ? `Saved and added ${added} payment${added > 1 ? 's' : ''}` : 'Saved');
+    await refresh('Saved');
   },
   payRec: async fd => {
     const r = S.recurring.find(x => x.id === fd.get('id')); if (!r) return;
     const amount = num(fd.get('amount'));
     if (!(amount > 0)) return toast('Enter the amount');
-    await addSplitExpenses({ amount: Math.round(amount * 100) / 100, category_id: r.category_id, note: r.name, spent_on: fd.get('spent_on'), shares: splitShares(r.split, Math.round(amount * 100) / 100), recurring_id: r.id });
+    await addSplitExpenses({ amount: Math.round(amount * 100) / 100, category_id: null, note: r.name, spent_on: fd.get('spent_on'), shares: splitShares(r.split, Math.round(amount * 100) / 100), recurring_id: r.id });
     closeSheet();
     await refresh(`Added ${eur(amount)}`);
   },
