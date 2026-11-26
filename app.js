@@ -121,7 +121,7 @@ const catBadge = c => `<span class="cicon" style="--c:${safeColor(c.color)}">${c
 
 /* ───────────── State ───────────── */
 const S = {
-  session: null, household: null, members: [], cats: [], budgets: [], exp: [], sav: [], recurring: [],
+  session: null, household: null, members: [], cats: [], budgets: [], exp: [], sav: [], recurring: [], paydays: [], period: 0,
   tab: 'home', month: monthKey(new Date()), channel: null, lastCat: null, f: {}, calc: null, savMode: 'together'
 };
 const uid = () => S.session?.user?.id;
@@ -161,8 +161,38 @@ const budgetOf = (catId, userId = uid()) => +(S.budgets.find(b => b.category_id 
 // Budgets marked as savings before the personal/joint choice existed: guess from the name.
 const savingKind = c => c?.saving_kind || (c?.is_saving ? (/household|joint|κοιν|σπιτ/i.test(c.name || '') ? 'joint' : 'personal') : null);
 const isSavingCat = c => !!savingKind(c);
-function savedInto(c, key = S.month, userId = uid()) {
-  const inMonth = S.sav.filter(s => s.saved_on.startsWith(key));
+/* Pay periods: each of you taps "Got paid" on payday, and that's where your new month starts.
+   Until the first "Got paid", periods are calendar months. */
+const addDays = (str, n) => { const d = new Date(str + 'T00:00'); d.setDate(d.getDate() + n); return ymd(d); };
+const addMonthDate = (str, n) => { const d = new Date(str + 'T00:00'), day = d.getDate(); const t = new Date(d.getFullYear(), d.getMonth() + n, 1);
+  t.setDate(Math.min(day, new Date(t.getFullYear(), t.getMonth() + 1, 0).getDate())); return ymd(t); };
+const myPaydays = (userId = uid()) => [...new Set(S.paydays.filter(p => p.user_id === userId && p.paid_on <= todayStr()).map(p => p.paid_on))]
+  .sort().reverse().filter(d => !S.loadedFrom || d >= S.loadedFrom);
+// i = 0 is the current period, 1 the one before, …
+function payPeriod(i = 0) {
+  const days = myPaydays();
+  if (!days.length) return null;
+  i = Math.max(0, Math.min(i, days.length - 1));
+  const from = days[i], to = i === 0 ? null : addDays(days[i - 1], -1);
+  return { i, count: days.length, from, to, end: to || addDays(addMonthDate(from, 1), -1) };
+}
+// The dates Home is showing: your current pay period, or a calendar month if you haven't used "Got paid" yet
+function homeRange() {
+  const today = todayStr(), P = payPeriod(S.period || 0);
+  if (P) {
+    const isNow = P.i === 0, total = daysBetween(P.from, P.end) + 1, elapsed = Math.min(total, daysBetween(P.from, today) + 1);
+    return { P, from: P.from, to: P.to || today, isNow, pace: isNow ? elapsed / total : 1,
+      daysLeft: isNow ? Math.max(1, daysBetween(today, P.end) + 1) : 0,
+      label: `${fmtDate(P.from)} – ${P.to ? fmtDate(P.to) : 'today'}` };
+  }
+  const isNow = S.month === monthKey(new Date()), dim = daysInMonth(S.month), day = new Date().getDate();
+  return { P: null, from: S.month + '-01', to: S.month + '-' + String(dim).padStart(2, '0'), isNow,
+    pace: isNow ? day / dim : 1, daysLeft: isNow ? dim - day + 1 : 0, label: monthLabel(S.month) };
+}
+const currentFrom = () => payPeriod(0)?.from || monthKey(new Date()) + '-01';
+
+function savedInto(c, from = currentFrom(), to = todayStr(), userId = uid()) {
+  const inMonth = S.sav.filter(s => s.saved_on >= from && s.saved_on <= to);
   return savingKind(c) === 'joint'
     ? sum(inMonth.filter(isJoint)) / Math.max(1, S.members.length)   // your half of the joint deposits
     : sum(inMonth.filter(s => s.account === 'personal' && s.saved_by === userId));
@@ -230,16 +260,18 @@ async function loadHousehold() {
 async function loadData() {
   const hid = S.household.id;
   const from = addMonths(S.month, -5) + '-01', to = addMonths(S.month, 1) + '-01';
-  const [cats, budgets, exp, sav, members, recurring] = await Promise.all([
+  S.loadedFrom = from;
+  const [cats, budgets, exp, sav, members, recurring, paydays] = await Promise.all([
     q(sb.from('categories').select('*').eq('household_id', hid).order('sort').order('name')),
     q(sb.from('budgets').select('*').eq('household_id', hid)),
     q(sb.from('expenses').select('*').eq('household_id', hid).gte('spent_on', from).lt('spent_on', to)
       .order('spent_on', { ascending: false }).order('created_at', { ascending: false })),
     q(sb.from('savings').select('*').eq('household_id', hid).order('saved_on', { ascending: false }).order('created_at', { ascending: false })),
     q(sb.from('members').select('*').eq('household_id', hid).order('joined_at')),
-    q(sb.from('recurring').select('*').eq('household_id', hid).order('next_due'))
+    q(sb.from('recurring').select('*').eq('household_id', hid).order('next_due')),
+    q(sb.from('paydays').select('*').eq('household_id', hid).order('paid_on', { ascending: false }).limit(60))
   ]);
-  Object.assign(S, { cats, budgets, exp, sav, members, recurring });
+  Object.assign(S, { cats, budgets, exp, sav, members, recurring, paydays });
 }
 
 let reloadTimer;
@@ -257,6 +289,7 @@ function subscribe() {
     .on('postgres_changes', { event: '*', schema: 'public', table: 'categories' }, scheduleReload)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'budgets' }, scheduleReload)
     .on('postgres_changes', { event: '*', schema: 'public', table: 'recurring' }, scheduleReload)
+    .on('postgres_changes', { event: '*', schema: 'public', table: 'paydays' }, scheduleReload)
     .subscribe();
 }
 document.addEventListener('visibilitychange', () => {
@@ -379,7 +412,7 @@ function paidNow(r) {
     const last = list.map(e => e.spent_on).sort().pop();
     return last && daysBetween(last, todayStr()) < Math.max(1, +r.every_days || 30) ? list.filter(e => e.spent_on === last) : [];
   }
-  return list.filter(e => e.spent_on.startsWith(monthKey(new Date())));
+  return list.filter(e => e.spent_on >= currentFrom());   // paid in this pay period
 }
 function recItem(r) {
   const freq = r.repeat === 'days' ? `Every ${r.every_days} days` : 'Monthly';
@@ -475,6 +508,19 @@ function syncRecurringForm(form, changed) {
   }
 }
 
+function gotPaidForm() {
+  const mine = S.paydays.filter(p => p.user_id === uid()).sort((a, b) => b.paid_on.localeCompare(a.paid_on)).slice(0, 4);
+  return `<form data-form="payday" class="stack">
+    <div class="sheet-head"><h3>Got paid</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
+    <p class="muted" style="margin:0">Your new month starts on this day.</p>
+    <input type="date" name="paid_on" value="${todayStr()}" max="${todayStr()}" required>
+    <button class="btn primary">${ic('check', 16)} Start my new month</button>
+    ${mine.length ? `<label class="f">Your last paydays</label><div class="list">${mine.map(p => `<div class="item">
+      <span class="cicon" style="--c:var(--brand)">${ic('wallet', 16)}</span><div class="grow">${fmtDate(p.paid_on)}</div>
+      <button type="button" class="iconbtn" data-act="delPayday" data-id="${p.id}" title="Remove">${ic('trash', 15)}</button></div>`).join('')}</div>` : ''}
+  </form>`;
+}
+
 function payForm(r) {
   return `<form data-form="payRec" class="stack">
     <div class="sheet-head"><h3>${esc(r.name)}</h3><button type="button" class="x" data-act="close">${ic('x', 16)}</button></div>
@@ -538,19 +584,22 @@ function folders(page, items, title) {
 
 
 /* ───────────── Home ───────────── */
-function viewHome() {
-  const now = monthKey(new Date()), isNow = S.month === now;
-  const dim = daysInMonth(S.month), day = new Date().getDate();
-  const daysLeft = isNow ? dim - day + 1 : 0;
-  const pace = isNow ? day / dim : 1;
+function homeNav(Rg) {
+  if (!Rg.P) return monthNav();
+  return `<div class="monthnav"><button data-act="prevPeriod" aria-label="Previous period" ${Rg.P.i >= Rg.P.count - 1 ? 'disabled' : ''}>${ic('left')}</button>
+    <h1>${Rg.label}</h1>
+    <button data-act="nextPeriod" aria-label="Next period" ${Rg.P.i === 0 ? 'disabled' : ''}>${ic('right')}</button></div>`;
+}
 
-  const ex = monthExp(), spendEx = spendOnly(ex);
+function viewHome() {
+  const Rg = homeRange(), isNow = Rg.isNow, daysLeft = Rg.daysLeft, pace = Rg.pace;
+  const ex = S.exp.filter(e => e.paid_by === uid() && e.spent_on >= Rg.from && e.spent_on <= Rg.to), spendEx = spendOnly(ex);
   const t = catTotals(ex.filter(e => !e.recurring_id));   // categories don't include recurring bills
   const spent = sum(spendEx), budget = myBudgetTotal(), left = budget - spent;
   const savedPlan = mySavingBudget();
   const perDay = isNow ? Math.max(0, left) / daysLeft : null;
 
-  const rows = S.cats.map(c => ({ c, spent: isSavingCat(c) ? savedInto(c) : (t[c.id] || 0), budget: budgetOf(c.id) })).filter(r => r.budget || r.spent);
+  const rows = S.cats.map(c => ({ c, spent: isSavingCat(c) ? savedInto(c, Rg.from, Rg.to) : (t[c.id] || 0), budget: budgetOf(c.id) })).filter(r => r.budget || r.spent);
   const savedNow = sum(rows.filter(r => isSavingCat(r.c)), r => r.spent);
   if (t.none) rows.push({ c: catOf(null), spent: t.none, budget: 0 });
   const recBudget = recurringMonthly(), recSpent = sum(ex.filter(e => e.recurring_id));
@@ -577,17 +626,18 @@ function viewHome() {
 
   const expensesBody = () => `<div class="list">${spendEx.length ? spendEx.map(expItem).join('') : '<div class="empty">Nothing yet. Tap + to add an expense.</div>'}</div>`;
 
-  return `${monthNav()}
+  return `${homeNav(Rg)}
   <div class="card">
-    <div class="row between muted"><span>You spent this month</span><span>Your budget ${eur0(budget)}</span></div>
+    <div class="row between"><span class="muted">You spent · budget ${eur0(budget)}</span>
+      <button class="btn small paidbtn" data-act="gotPaid">${ic('wallet', 14)} Got paid</button></div>
     <div class="big">${eur(spent)}</div>
     ${bar(budget ? spent / budget : 0)}
     <div class="grid3">
       <div class="stat"><b class="${left < 0 ? 'neg' : ''}">${eur0(left)}</b><span>${left < 0 ? 'Over budget' : 'Left to spend'}</span></div>
       <div class="stat"><b>${perDay != null ? eur0(perDay) : '—'}</b><span>Can spend / day</span></div>
-      <div class="stat"><b>${isNow ? daysLeft : '—'}</b><span>${isNow ? (daysLeft === 1 ? 'Day left' : 'Days left') : 'Month ended'}</span></div>
+      <div class="stat"><b>${isNow ? daysLeft : '—'}</b><span>${isNow ? (daysLeft === 1 ? 'Day left' : 'Days left') : 'Period ended'}</span></div>
     </div>
-    ${savedPlan ? `<p class="muted" style="margin:8px 0 0">Saved ${eur0(savedNow)} of ${eur0(savedPlan)} this month</p>` : ''}
+    ${savedPlan ? `<p class="muted" style="margin:8px 0 0">Saved ${eur0(savedNow)} of ${eur0(savedPlan)} so far</p>` : ''}
   </div>
   ${folders('home', [
     { id: 'budgets', label: `${ic('target', 14)} Budgets`, color: 'var(--brand)', dot: over.length ? 'over' : fast.length ? 'warn' : '', body: budgetsBody },
@@ -1197,6 +1247,13 @@ const ACTIONS = {
   },
   addRecurring: () => { if (S.tab === 'settings' && !okToLeave()) return; openSheet(recurringForm()); },
   editRecurring: d => { if (S.tab === 'settings' && !okToLeave()) return; const r = S.recurring.find(x => x.id === d.id); if (r) openSheet(recurringForm(r)); },
+  gotPaid: () => openSheet(gotPaidForm()),
+  delPayday: async d => {
+    if (!confirm('Remove this payday?')) return;
+    await q(sb.from('paydays').delete().eq('id', d.id)); closeSheet(); S.period = 0; await refresh('Removed');
+  },
+  prevPeriod: () => { S.period = (S.period || 0) + 1; render(); },
+  nextPeriod: () => { S.period = Math.max(0, (S.period || 0) - 1); render(); },
   markPaid: async (d, btn) => {
     const r = S.recurring.find(x => x.id === d.id); if (!r || !isFixed(r)) return;
     if (btn) btn.disabled = true;
@@ -1351,6 +1408,14 @@ const FORMS = {
     await q(sb.from('budgets').upsert(S.members.map(m => ({ household_id: S.household.id, category_id: id, user_id: m.user_id, amount: num(fd.get('b_' + m.user_id)) || 0 })), { onConflict: 'category_id,user_id' }));
     closeSheet();
     await refresh(fd.get('id') ? 'Saved' : 'Added');
+  },
+  payday: async fd => {
+    const day = fd.get('paid_on');
+    if (!day) return toast('Pick the day you got paid');
+    if (!S.paydays.some(p => p.user_id === uid() && p.paid_on === day))
+      await q(sb.from('paydays').insert({ household_id: S.household.id, user_id: uid(), paid_on: day }));
+    closeSheet(); S.period = 0;
+    await refresh('New month started');
   },
   recurring: async fd => {
     const fixed = fd.get('kind') === 'fixed';
