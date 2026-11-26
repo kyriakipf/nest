@@ -378,9 +378,17 @@ const monthlyOf = r => (isFixed(r) ? +r.amount : ((+r.min_amount || 0) + (+r.max
 const recurringMonthly = (userId = uid()) => sum(S.recurring, r => monthlyOf(r) * fractionOf(r, userId));
 
 // One expense per person; split halves share a split_id so they can be deleted together.
-async function addSplitExpenses({ amount, category_id, note, spent_on, shares, recurring_id = null }) {
+// Spread a purchase over several months: 177 € over 3,5 months → 50,57 + 50,57 + 50,57 + 25,29
+function spreadParts(total, months) {
+  const full = Math.floor(months), frac = Math.round((months - full) * 100) / 100;
+  const w = [...Array(full).fill(1), ...(frac > 0 ? [frac] : [])], wsum = w.reduce((a, b) => a + b, 0);
+  let left = Math.round(total * 100);
+  return w.map((x, i) => { const c = i === w.length - 1 ? left : Math.round(total * 100 * x / wsum); left -= c; return { offset: i, amount: c / 100 }; });
+}
+
+async function addSplitExpenses({ amount, category_id, note, spent_on, shares, recurring_id = null, spread_id = null }) {
   const split_id = shares.length > 1 ? newId() : null;
-  const rows = shares.map(s => ({ household_id: S.household.id, amount: s.amount, category_id, note, spent_on, paid_by: s.user_id, split_id, recurring_id }));
+  const rows = shares.map(s => ({ household_id: S.household.id, amount: s.amount, category_id, note, spent_on, paid_by: s.user_id, split_id, recurring_id, spread_id }));
   if (rows.length) await q(sb.from('expenses').insert(rows));
 }
 
@@ -566,7 +574,7 @@ function expItem(e) {
   return `<div class="item" data-act="edit" data-id="${e.id}">
     ${catBadge(c)}
     <div class="grow"><div class="ellipsis">${esc(e.note || c.name)}</div>
-      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}${!e.recurring_id && e.split_id ? ' · Split' : ''}</div></div>
+      <div class="muted">${fmtDate(e.spent_on)} · ${esc(memberName(e.paid_by))}${e.note ? ' · ' + esc(c.name) : ''}${e.spread_id ? ' · Spread' : !e.recurring_id && e.split_id ? ' · Split' : ''}</div></div>
     <div class="amt">${eur(e.amount)}</div></div>`;
 }
 
@@ -1171,6 +1179,11 @@ const whoToggle = (name, sel = uid()) => `<div class="seg">${[...S.members].sort
 const partnerOf = () => S.members.find(m => m.user_id !== uid());
 // Split a new expense: typing one part fills in the other; untouched, it's half each.
 function syncExpenseSplit(form, changed) {
+  const prev = form.querySelector('.spreadprev');
+  if (prev) {
+    const months = num(form.querySelector('[name=spread]').value) || 1, total = num(form.querySelector('[name=amount]').value) || 0;
+    prev.textContent = months > 1 && total ? `≈ ${eur(Math.round(total / months * 100) / 100)} / month` : '';
+  }
   const row = form.querySelector('.splitrow');
   if (!row) return;
   const split = form.querySelector('[name=mode]:checked')?.value === 'split';
@@ -1198,13 +1211,15 @@ function expenseForm(e = {}) {
       : `<div class="chips">${cats.map(c => `<label class="chip"><input type="radio" name="category_id" value="${c.id}" ${c.id === sel ? 'checked' : ''}><span>${catIc(c, 14)} ${esc(c.name)}</span></label>`).join('')}</div>`}
     <input name="note" placeholder="Note (e.g. souvlaki, Lidl)" value="${esc(e.note || '')}" maxlength="120">
     <input type="date" name="spent_on" value="${e.spent_on || todayStr()}" required>
+    ${!e.id ? `<div class="spreadrow"><span>Spread over</span><input name="spread" inputmode="decimal" autocomplete="off" placeholder="1"><span>months</span><span class="muted spreadprev"></span></div>` : ''}
     <input type="hidden" name="paid_by" value="${e.paid_by || uid()}">
     ${!e.id && partnerOf() ? `<div class="seg"><label><input type="radio" name="mode" value="mine" checked><span>${ic('user', 14)} Mine</span></label>
       <label><input type="radio" name="mode" value="split"><span>${ic('users', 14)} Split</span></label></div>
     <div class="splitrow hidden"><div class="grid2">
       <label class="spl"><small>You pay</small><input name="my_share" class="money" inputmode="decimal" autocomplete="off"></label>
       <label class="spl"><small>${esc(partnerOf().display_name)} pays</small><input name="their_share" class="money" inputmode="decimal" autocomplete="off"></label></div></div>` : ''}
-    ${e.id && e.split_id ? `<p class="muted" style="margin:0">Split expense. Deleting removes both parts.</p>` : ''}
+    ${e.id && e.spread_id ? `<p class="muted" style="margin:0">Spread over several months. Deleting removes every part.</p>`
+      : e.id && e.split_id ? `<p class="muted" style="margin:0">Split expense. Deleting removes both parts.</p>` : ''}
     <button class="btn primary">${e.id ? 'Save' : 'Add expense'}</button>
     ${e.id ? `<button type="button" class="btn danger" data-act="delExpense" data-id="${e.id}">Delete</button>` : ''}
   </form>`;
@@ -1241,8 +1256,9 @@ const ACTIONS = {
   nextMonth: async () => { const n = addMonths(S.month, 1); if (n <= monthKey(new Date())) { S.month = n; await refresh(); } },
   delExpense: async d => {
     const e = S.exp.find(x => x.id === d.id);
-    if (!confirm(e?.split_id ? 'Delete this split expense? Both parts are removed.' : 'Delete this expense?')) return;
-    await q(e?.split_id ? sb.from('expenses').delete().eq('split_id', e.split_id) : sb.from('expenses').delete().eq('id', d.id));
+    if (!confirm(e?.spread_id ? 'Delete this spread expense? Every month\'s part is removed.' : e?.split_id ? 'Delete this split expense? Both parts are removed.' : 'Delete this expense?')) return;
+    await q(e?.spread_id ? sb.from('expenses').delete().eq('spread_id', e.spread_id)
+      : e?.split_id ? sb.from('expenses').delete().eq('split_id', e.split_id) : sb.from('expenses').delete().eq('id', d.id));
     closeSheet(); await refresh('Deleted');
   },
   addRecurring: () => { if (S.tab === 'settings' && !okToLeave()) return; openSheet(recurringForm()); },
@@ -1375,15 +1391,25 @@ const FORMS = {
   expense: async fd => {
     const amount = num(fd.get('amount'));
     if (!(amount > 0)) return toast('Enter an amount');
-    if (fd.get('mode') === 'split' && !fd.get('id')) {
+    if (!fd.get('id')) {
       const total = Math.round(amount * 100) / 100;
-      const mine = fd.get('my_share') ? Math.round(num(fd.get('my_share')) * 100) / 100 : Math.round(total * 50) / 100;
-      if (!(mine >= 0) || mine > total) return toast("Your part can't be more than the total");
-      await addSplitExpenses({ amount: total, category_id: fd.get('category_id') || null, note: fd.get('note').trim() || null, spent_on: fd.get('spent_on'),
-        shares: [{ user_id: uid(), amount: mine }, { user_id: partnerOf().user_id, amount: Math.round((total - mine) * 100) / 100 }].filter(s => s.amount > 0) });
+      const months = Math.min(36, Math.max(1, num(fd.get('spread')) || 1));
+      const split = fd.get('mode') === 'split';
+      const mine = !split ? total : fd.get('my_share') ? Math.round(num(fd.get('my_share')) * 100) / 100 : Math.round(total * 50) / 100;
+      if (split && (!(mine >= 0) || mine > total)) return toast("Your part can't be more than the total");
+      const parts = months > 1 ? spreadParts(total, months) : [{ offset: 0, amount: total }];
+      const spread_id = parts.length > 1 ? newId() : null;
+      for (const part of parts) {
+        const myPart = Math.round(part.amount * mine / total * 100) / 100;
+        const shares = split
+          ? [{ user_id: uid(), amount: myPart }, { user_id: partnerOf().user_id, amount: Math.round((part.amount - myPart) * 100) / 100 }]
+          : [{ user_id: fd.get('paid_by') || uid(), amount: part.amount }];
+        await addSplitExpenses({ amount: part.amount, category_id: fd.get('category_id') || null, note: fd.get('note').trim() || null,
+          spent_on: addMonthDate(fd.get('spent_on'), part.offset), shares: shares.filter(s => s.amount > 0), spread_id });
+      }
       S.lastCat = fd.get('category_id');
       closeSheet();
-      return refresh(`Split ${eur(total)}`);
+      return refresh(parts.length > 1 ? `${eur(total)} spread over ${String(months).replace('.', ',')} months` : split ? `Split ${eur(total)}` : `Added ${eur(total)}`);
     }
     const row = {
       household_id: S.household.id, amount: Math.round(amount * 100) / 100,
